@@ -170,3 +170,48 @@ fn scan_cached_blocks_detects_spends_out_of_order() {
 fn receive_two_notes_with_same_value() {
     testing::pool::receive_two_notes_with_same_value::<SaplingPoolTester>()
 }
+
+#[test]
+fn spent_nullifiers_stay_hidden_after_pruning() {
+    use zcash_client_backend::data_api::WalletRead;
+    testing::pool::spent_nullifiers_stay_hidden_after_pruning::<SaplingPoolTester>(
+        |wallet, query| {
+            wallet
+                .get_sapling_nullifiers(query)
+                .unwrap()
+                .into_iter()
+                .map(|(_, nf)| nf)
+                .collect()
+        },
+    )
+}
+
+#[test]
+fn rolled_back_spend_returns_the_note_to_unspent() {
+    use zcash_client_backend::data_api::WalletRead;
+    testing::pool::rolled_back_spend_returns_the_note_to_unspent::<SaplingPoolTester>(
+        |wallet, query| {
+            wallet
+                .get_sapling_nullifiers(query)
+                .unwrap()
+                .into_iter()
+                .map(|(_, nf)| nf)
+                .collect()
+        },
+    );
+}
+
+#[test]
+fn failed_put_blocks_leaves_the_wallet_dirty() {
+    testing::pool::failed_put_blocks_leaves_the_wallet_dirty::<SaplingPoolTester>()
+}
+
+#[test]
+fn sync_state_accessors() {
+    testing::pool::sync_state_accessors::<SaplingPoolTester>()
+}
+
+#[test]
+fn truncate_drops_nullifier_map_entries_above_the_height() {
+    testing::pool::truncate_drops_nullifier_map_entries_above_the_height::<SaplingPoolTester>()
+}

@@ -12,7 +12,7 @@ use zcash_client_backend::{
 };
 use zcash_keys::address::Address;
 use zcash_protocol::{
-    ShieldedProtocol, TxId,
+    ShieldedPool, TxId,
     consensus::BlockHeight,
     local_consensus::LocalNetwork,
     value::{ZatBalance, Zatoshis},
@@ -32,6 +32,9 @@ use {
 };
 
 pub mod pool;
+
+#[cfg(test)]
+mod pruning;
 
 #[cfg(test)]
 #[cfg(feature = "transparent-inputs")]
@@ -196,24 +199,19 @@ where
 
     fn get_notes(
         &self,
-        protocol: zcash_protocol::ShieldedProtocol,
+        protocol: zcash_protocol::ShieldedPool,
     ) -> Result<Vec<ReceivedNote<NoteId, Note>>, Error> {
-        Ok(self
-            .received_notes
+        self.received_notes
             .iter()
             .filter(|rn| rn.note.pool() == protocol)
             .cloned()
-            .map(Into::into)
-            .collect())
+            .map(TryInto::try_into)
+            .collect()
     }
 
     /// Returns the note IDs for shielded notes sent by the wallet in a particular
     /// transaction.
-    fn get_sent_note_ids(
-        &self,
-        txid: &TxId,
-        protocol: ShieldedProtocol,
-    ) -> Result<Vec<NoteId>, Error> {
+    fn get_sent_note_ids(&self, txid: &TxId, protocol: ShieldedPool) -> Result<Vec<NoteId>, Error> {
         Ok(self
             .get_sent_notes()
             .keys()
@@ -316,9 +314,9 @@ where
                 ]
                 .into_iter()
                 .find_map(identity)
-                .ok_or(Error::Other(
-                    format!("Account id could not be found for tx: {}", txid).to_string(),
-                ))?;
+                .ok_or(Error::Other(format!(
+                    "Account id could not be found for tx: {txid}"
+                )))?;
 
                 let balance_gained: u64 = received_notes
                     .iter()
@@ -377,12 +375,12 @@ where
 
     fn get_checkpoint_history(
         &self,
-        protocol: &ShieldedProtocol,
+        protocol: &ShieldedPool,
     ) -> Result<Vec<(BlockHeight, Option<incrementalmerkletree::Position>)>, Error> {
         let mut checkpoints = Vec::new();
 
         match protocol {
-            ShieldedProtocol::Sapling => {
+            ShieldedPool::Sapling => {
                 self.sapling_tree
                     .store()
                     .for_each_checkpoint(usize::MAX, |id, cp| {
@@ -391,7 +389,7 @@ where
                     })?;
             }
             #[cfg(feature = "orchard")]
-            ShieldedProtocol::Orchard => {
+            ShieldedPool::Orchard => {
                 self.orchard_tree
                     .store()
                     .for_each_checkpoint(usize::MAX, |id, cp| {
@@ -399,10 +397,15 @@ where
                         Ok(())
                     })?;
             }
-            // The in-memory backend maintains no Ironwood (NU6.3) note commitment tree, so it has
-            // no Ironwood checkpoint history to report.
             #[cfg(feature = "orchard")]
-            ShieldedProtocol::Ironwood => {}
+            ShieldedPool::Ironwood => {
+                self.ironwood_tree
+                    .store()
+                    .for_each_checkpoint(usize::MAX, |id, cp| {
+                        checkpoints.push((*id, cp.position()));
+                        Ok(())
+                    })?;
+            }
             #[cfg(not(feature = "orchard"))]
             _ => {}
         }
@@ -413,12 +416,28 @@ where
     }
 
     fn finally(&self) {
+        // A wallet left dirty by a failed write is documented as not encodable, so there is
+        // nothing to round-trip; the tests that provoke such a failure assert on it directly.
+        if self.is_dirty().is_some() {
+            return;
+        }
+
         // ensure the wallet state at the conclusion of each test can be round-tripped through serialization
-        let proto = crate::proto::memwallet::MemoryWallet::from(self);
-        let recovered_wallet =
-            MemoryWalletDb::new_from_proto(proto.clone(), self.params.clone(), 100).unwrap();
+        let bytes = self.encode_to_vec().unwrap();
+        let recovered_wallet = MemoryWalletDb::decode_new(&bytes[..], self.params.clone(), 100)
+            .expect("the wallet decodes from its own encoding");
 
         assert_eq!(self, &recovered_wallet);
+
+        // `PartialEq` skips the note commitment trees, so compare their wire form too: the
+        // recovered wallet must encode to exactly the bytes it was decoded from, which covers
+        // every tree's cap, shards and checkpoints (including empty-tree checkpoints and
+        // removed marks).
+        assert_eq!(
+            recovered_wallet.encode_to_vec().unwrap(),
+            bytes,
+            "re-encoding the decoded wallet must reproduce the original blob"
+        );
 
         // ensure the trees can be roundtripped
         use crate::wallet_commitment_trees::serialization::{tree_from_protobuf, tree_to_protobuf};

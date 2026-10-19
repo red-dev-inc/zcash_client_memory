@@ -21,8 +21,8 @@ use shardtree::{
 use zcash_client_backend::wallet::TransparentAddressMetadata;
 use zcash_client_backend::{
     data_api::{
-        Account as _, AccountBirthday, AccountSource, InputSource, Ratio, SAPLING_SHARD_HEIGHT,
-        TransactionStatus, WalletRead,
+        Account as _, AccountBirthday, AccountPurpose, AccountSource, InputSource, NullifierQuery,
+        Ratio, SAPLING_SHARD_HEIGHT, TransactionStatus, WalletRead,
         scanning::{ScanPriority, ScanRange},
         wallet::{ConfirmationsPolicy, TargetHeight},
     },
@@ -31,7 +31,7 @@ use zcash_client_backend::{
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::{
-    ShieldedProtocol, TxId,
+    ShieldedPool, TxId,
     consensus::{self, BlockHeight, NetworkUpgrade, TxIndex},
 };
 use zip32::{Scope, fingerprint::SeedFingerprint};
@@ -50,6 +50,47 @@ use crate::types::transparent::{
     TransparentReceivedOutputSpends, TransparentReceivedOutputs, TransparentSpendCache,
 };
 use crate::types::*;
+
+/// What identifies a wallet account to the application: enough to recognise the account again
+/// after the wallet is restored, and to tell a derived account from an imported one.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct AccountIdentity {
+    account_id: AccountId,
+    ufvk: String,
+    seed_fingerprint: Option<[u8; 32]>,
+    hd_index: Option<u32>,
+    birthday_height: BlockHeight,
+}
+
+impl AccountIdentity {
+    /// The wallet-internal account identifier.
+    pub fn account_id(&self) -> AccountId {
+        self.account_id
+    }
+
+    /// The account's unified full viewing key, encoded for the wallet's network.
+    pub fn ufvk(&self) -> &str {
+        &self.ufvk
+    }
+
+    /// The ZIP 32 fingerprint of the seed the account's keys were derived from, when known. It
+    /// is known for derived accounts and for imported spending accounts that recorded their
+    /// derivation; it is `None` for view-only accounts.
+    pub fn seed_fingerprint(&self) -> Option<[u8; 32]> {
+        self.seed_fingerprint
+    }
+
+    /// The ZIP 32 account index the keys were derived at, when known (see
+    /// [`Self::seed_fingerprint`]).
+    pub fn hd_index(&self) -> Option<u32> {
+        self.hd_index
+    }
+
+    /// The height from which the account's funds are scanned for.
+    pub fn birthday_height(&self) -> BlockHeight {
+        self.birthday_height
+    }
+}
 
 /// The main in-memory wallet database. Implements all the traits needed to be used as a backend.
 #[derive(Debug)]
@@ -90,6 +131,16 @@ pub struct MemoryWalletDb<P: consensus::Parameters> {
     #[cfg(feature = "orchard")]
     /// Stores the block height corresponding to the last note commitment in a shard
     pub(crate) orchard_tree_shard_end_heights: BTreeMap<Address, BlockHeight>,
+    /// Ironwood (NU6.3) commitment tree. Orchard-shaped, but a separate tree for a separate pool.
+    #[cfg(feature = "orchard")]
+    pub(crate) ironwood_tree: ShardTree<
+        MemoryShardStore<orchard::tree::MerkleHashOrchard, BlockHeight>,
+        { ORCHARD_SHARD_HEIGHT * 2 },
+        ORCHARD_SHARD_HEIGHT,
+    >,
+    #[cfg(feature = "orchard")]
+    /// Stores the block height corresponding to the last note commitment in a shard
+    pub(crate) ironwood_tree_shard_end_heights: BTreeMap<Address, BlockHeight>,
 
     /// Transparent outputs received by the wallet
     pub(crate) transparent_received_outputs: TransparentReceivedOutputs,
@@ -102,15 +153,23 @@ pub struct MemoryWalletDb<P: consensus::Parameters> {
     pub(crate) transaction_data_request_queue: TransactionDataRequestQueue,
     /// Queue of block ranges that should be scanned along with their priority
     pub(crate) scan_queue: ScanQueue,
+
+    /// The name of the write operation that failed part-way, if any. Set by [`Self::mutate`]
+    /// for the duration of an operation and cleared only when it succeeds, so an error leaves
+    /// it set. Never serialized: a dirty wallet refuses to be encoded at all, and a decoded
+    /// wallet is always clean. Not part of `PartialEq`.
+    dirty: Option<&'static str>,
 }
 
 impl<P: consensus::Parameters + PartialEq> PartialEq for MemoryWalletDb<P> {
     /// Tests for equality between two `MemoryWalletDb` instances.
-    /// but does NOT compare the sapling_tree and orchard_tree fields.
+    /// but does NOT compare the sapling_tree, orchard_tree and ironwood_tree fields.
     fn eq(&self, other: &Self) -> bool {
         #[cfg(feature = "orchard")]
-        let orchard_comparisons =
-            { self.orchard_tree_shard_end_heights == other.orchard_tree_shard_end_heights };
+        let orchard_comparisons = {
+            self.orchard_tree_shard_end_heights == other.orchard_tree_shard_end_heights
+                && self.ironwood_tree_shard_end_heights == other.ironwood_tree_shard_end_heights
+        };
         #[cfg(not(feature = "orchard"))]
         let orchard_comparisons = true;
 
@@ -153,6 +212,10 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
             orchard_tree: ShardTree::new(MemoryShardStore::empty(), max_checkpoints),
             #[cfg(feature = "orchard")]
             orchard_tree_shard_end_heights: BTreeMap::new(),
+            #[cfg(feature = "orchard")]
+            ironwood_tree: ShardTree::new(MemoryShardStore::empty(), max_checkpoints),
+            #[cfg(feature = "orchard")]
+            ironwood_tree_shard_end_heights: BTreeMap::new(),
             tx_table: TransactionTable::new(),
             received_notes: ReceivedNoteTable::new(),
             sent_notes: SentNoteTable::new(),
@@ -164,6 +227,7 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
             transparent_received_output_spends: TransparentReceivedOutputSpends::new(),
             transparent_spend_map: TransparentSpendCache::new(),
             transaction_data_request_queue: TransactionDataRequestQueue::new(),
+            dirty: None,
         }
     }
 
@@ -171,7 +235,51 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
         &self.params
     }
 
+    /// The write operation that failed part-way and left the wallet in an inconsistent state,
+    /// if any. A dirty wallet refuses further writes and refuses to be encoded; the caller
+    /// should discard it and rebuild from the last successfully persisted encoding.
+    pub fn is_dirty(&self) -> Option<&'static str> {
+        self.dirty
+    }
+
+    /// Returns [`Error::DirtyState`] if a write operation failed part-way.
+    pub(crate) fn check_clean(&self) -> Result<(), Error> {
+        match self.dirty {
+            Some(op) => Err(Error::DirtyState(op)),
+            None => Ok(()),
+        }
+    }
+
+    /// Runs `f`, a write operation that touches persisted state, as a unit: the wallet is marked
+    /// dirty with the operation's name before `f` starts and marked clean only if `f` returns
+    /// `Ok`. There is no rollback, so if `f` fails part-way the wallet stays dirty, every later
+    /// mutation and every attempt to encode it fail with [`Error::DirtyState`], and the caller
+    /// must rebuild the wallet from its last good encoding. Refuses to start on a dirty wallet.
+    pub(crate) fn mutate<R>(
+        &mut self,
+        op: &'static str,
+        f: impl FnOnce(&mut Self) -> Result<R, Error>,
+    ) -> Result<R, Error> {
+        self.check_clean()?;
+        self.dirty = Some(op);
+        let result = f(self)?;
+        self.dirty = None;
+        Ok(result)
+    }
+
     pub(crate) fn add_account(
+        &mut self,
+        account_name: &str,
+        kind: AccountSource,
+        viewing_key: UnifiedFullViewingKey,
+        birthday: AccountBirthday,
+    ) -> Result<(AccountId, Account), Error> {
+        self.mutate("add_account", |db| {
+            db.add_account_inner(account_name, kind, viewing_key, birthday)
+        })
+    }
+
+    fn add_account_inner(
         &mut self,
         account_name: &str,
         kind: AccountSource,
@@ -214,6 +322,19 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
                     // `frontier` is the tree state at the start of the block. Together, this means
                     // there exists a prior block for which frontier is the tree state at the end of
                     // the block.
+                    id: birthday.height() - 1,
+                    marking: Marking::Reference,
+                },
+            )?;
+        }
+
+        #[cfg(feature = "orchard")]
+        if let Some(frontier) = birthday.prior_chain_state().final_ironwood_tree().value() {
+            tracing::debug!("Inserting Ironwood frontier into ShardTree: {:?}", frontier);
+            self.ironwood_tree.insert_frontier_nodes(
+                frontier.clone(),
+                Retention::Checkpoint {
+                    // See the Sapling case above for why this subtraction is safe.
                     id: birthday.height() - 1,
                     marking: Marking::Reference,
                 },
@@ -386,6 +507,15 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
             )?,
         );
 
+        #[cfg(feature = "orchard")]
+        funding_accounts.extend(
+            self.received_notes.detect_ironwood_spending_accounts(
+                tx.ironwood_bundle()
+                    .iter()
+                    .flat_map(|bundle| bundle.actions().iter().map(|action| action.nullifier())),
+            )?,
+        );
+
         Ok(funding_accounts)
     }
 
@@ -414,6 +544,47 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
     /// Returns true if the note is in the spent notes table and the transaction that spent it is
     /// in the transaction table and has either been mined or can be mined in the future
     /// (i.e. it hasn't or will not expire)
+    /// Returns, for every received note whose nullifier `select` accepts, the account that
+    /// received the note together with the selected nullifier.
+    ///
+    /// For [`NullifierQuery::Unspent`], notes with an effective spend (see
+    /// [`Self::spend_is_effective`]) are omitted. The wallet's spend record is consulted rather
+    /// than the chain nullifier map: that map is pruned below the fully scanned height, so its
+    /// absence of an entry cannot distinguish an unspent note from one spent long ago.
+    pub(crate) fn select_nullifiers<N>(
+        &self,
+        query: NullifierQuery,
+        select: impl Fn(Option<&Nullifier>) -> Option<N>,
+    ) -> Vec<(AccountId, N)> {
+        self.received_notes
+            .iter()
+            .filter_map(|note| {
+                let nf = select(note.nullifier())?;
+                match query {
+                    NullifierQuery::All => Some((note.account_id(), nf)),
+                    NullifierQuery::Unspent => (!self.spend_is_effective(&note.note_id()))
+                        .then_some((note.account_id(), nf)),
+                }
+            })
+            .collect()
+    }
+
+    /// Whether the note has a recorded spend that expiry cannot undo: the spending transaction
+    /// is mined, or has no expiry height. A spend by an unmined transaction that can still
+    /// expire is not effective, so the note's nullifier keeps being watched for.
+    pub(crate) fn spend_is_effective(&self, note_id: &NoteId) -> bool {
+        self.received_note_spends
+            .get(note_id)
+            .and_then(|txid| self.tx_table.get(txid))
+            .is_some_and(|tx| {
+                // As in `zcash_client_sqlite`, an unmined spend only counts once it can no longer
+                // expire: a raw transaction with expiry height 0. `None` means the expiry is
+                // unknown (the entry came from a scan), so the spend may still lapse.
+                matches!(tx.status(), TransactionStatus::Mined(_))
+                    || tx.expiry_height() == Some(BlockHeight::from(0))
+            })
+    }
+
     pub(crate) fn note_is_spent(
         &self,
         note: &ReceivedNote,
@@ -431,11 +602,13 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
                     TransactionStatus::Mined(_height) => true,
                     TransactionStatus::TxidNotRecognized => unreachable!(),
                     TransactionStatus::NotInMainChain => {
-                        // transaction either never expires, or expires in the future.
-                        spending_tx
-                            .expiry_height()
-                            .iter()
-                            .all(|h| *h >= BlockHeight::from(target_height))
+                        // The spend counts while the transaction cannot have lapsed: it never
+                        // expires (expiry height 0) or expires at or after the target height.
+                        // An unknown expiry (`None`, an entry created by a scan that was then
+                        // rolled back) may have lapsed, so the note is treated as unspent.
+                        spending_tx.expiry_height().is_some_and(|h| {
+                            h == BlockHeight::from(0) || h >= BlockHeight::from(target_height)
+                        })
                     }
                 }
             }
@@ -563,9 +736,23 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
         nf: orchard::note::Nullifier,
         txid: TxId,
     ) -> Result<(), Error> {
+        self.mark_orchard_family_note_spent(Nullifier::Orchard(nf), txid)
+    }
+
+    #[cfg(feature = "orchard")]
+    pub(crate) fn mark_ironwood_note_spent(
+        &mut self,
+        nf: orchard::note::Nullifier,
+        txid: TxId,
+    ) -> Result<(), Error> {
+        self.mark_orchard_family_note_spent(Nullifier::Ironwood(nf), txid)
+    }
+
+    #[cfg(feature = "orchard")]
+    fn mark_orchard_family_note_spent(&mut self, nf: Nullifier, txid: TxId) -> Result<(), Error> {
         let note_id = self
             .received_notes
-            .find_by_nullifier(&Nullifier::Orchard(nf))
+            .find_by_nullifier(&nf)
             .map(|n| n.note_id())
             .ok_or(Error::NoteNotFound)?;
         self.received_note_spends.insert_spend(note_id, txid);
@@ -603,6 +790,8 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
             self.received_note_spends.insert_spend(note_id, spent_in);
         }
     }
+    /// Records a scanned Orchard-family output (Orchard or Ironwood, by the output's value pool)
+    /// as a received note.
     #[cfg(feature = "orchard")]
     pub(crate) fn insert_received_orchard_note(
         &mut self,
@@ -616,6 +805,39 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
             self.received_note_spends.insert_spend(note_id, spent_in);
         }
     }
+    /// Drops nullifier-map and transaction-locator entries mined below
+    /// `fully_scanned_height - pruning_depth`, matching `zcash_client_sqlite`'s
+    /// `prune_tracked_nullifiers`.
+    ///
+    /// The maps exist so that a note found by out-of-order scanning can be matched to a spend in a
+    /// block that was scanned earlier. Every block below the fully scanned height has been scanned,
+    /// so no undiscovered note can exist there, and once the height is also past reorg depth the
+    /// entries below it can never be looked up again. Without this, a historic sync keeps every
+    /// nullifier on chain in memory (and in the serialized wallet) for the life of the wallet.
+    pub(crate) fn prune_tracked_nullifiers(&mut self, pruning_depth: u32) -> Result<(), Error> {
+        if let Some(meta) = self.block_fully_scanned()? {
+            self.prune_nullifier_map_below(meta.block_height().saturating_sub(pruning_depth));
+        }
+        Ok(())
+    }
+
+    /// Removes every nullifier-map and transaction-locator entry mined below `cutoff`.
+    pub(crate) fn prune_nullifier_map_below(&mut self, cutoff: BlockHeight) {
+        self.tx_locator.0.retain(|(height, _), _| *height >= cutoff);
+        self.nullifiers.0.retain(|_, (height, _)| *height >= cutoff);
+    }
+
+    /// Removes every nullifier-map and transaction-locator entry mined above `max_height`,
+    /// for blocks that a rewind has disowned.
+    pub(crate) fn prune_nullifier_map_above(&mut self, max_height: BlockHeight) {
+        self.tx_locator
+            .0
+            .retain(|(height, _), _| *height <= max_height);
+        self.nullifiers
+            .0
+            .retain(|_, (height, _)| *height <= max_height);
+    }
+
     pub(crate) fn insert_sapling_nullifier_map(
         &mut self,
         block_height: BlockHeight,
@@ -649,10 +871,40 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
         block_height: BlockHeight,
         new_entries: &[(TxIndex, TxId, Vec<orchard::note::Nullifier>)],
     ) -> Result<(), Error> {
+        self.insert_orchard_family_nullifier_map(
+            orchard::ValuePool::Orchard,
+            block_height,
+            new_entries,
+        )
+    }
+
+    #[cfg(feature = "orchard")]
+    pub(crate) fn insert_ironwood_nullifier_map(
+        &mut self,
+        block_height: BlockHeight,
+        new_entries: &[(TxIndex, TxId, Vec<orchard::note::Nullifier>)],
+    ) -> Result<(), Error> {
+        self.insert_orchard_family_nullifier_map(
+            orchard::ValuePool::Ironwood,
+            block_height,
+            new_entries,
+        )
+    }
+
+    #[cfg(feature = "orchard")]
+    fn insert_orchard_family_nullifier_map(
+        &mut self,
+        pool: orchard::ValuePool,
+        block_height: BlockHeight,
+        new_entries: &[(TxIndex, TxId, Vec<orchard::note::Nullifier>)],
+    ) -> Result<(), Error> {
         for (tx_index, txid, nullifiers) in new_entries {
             for nf in nullifiers.iter() {
-                self.nullifiers
-                    .insert(block_height, u32::from(*tx_index), Nullifier::Orchard(*nf));
+                self.nullifiers.insert(
+                    block_height,
+                    u32::from(*tx_index),
+                    Nullifier::orchard_family(pool, *nf),
+                );
             }
             match self.tx_locator.entry((block_height, u32::from(*tx_index))) {
                 Entry::Occupied(x) => {
@@ -694,21 +946,21 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
         self.orchard_tree_shard_end_heights.values().max().copied()
     }
 
+    #[cfg(feature = "orchard")]
+    pub(crate) fn ironwood_tip_shard_end_height(&self) -> Option<BlockHeight> {
+        self.ironwood_tree_shard_end_heights.values().max().copied()
+    }
+
     pub(crate) fn get_sapling_max_checkpointed_height(
         &self,
         chain_tip_height: BlockHeight,
         min_confirmations: NonZeroU32,
     ) -> Result<Option<BlockHeight>, Error> {
-        let max_checkpoint_height =
-            u32::from(chain_tip_height).saturating_sub(u32::from(min_confirmations) - 1);
-        // scan backward and find the first checkpoint that matches a blockheight prior to max_checkpoint_height
-        for height in (0..=max_checkpoint_height).rev() {
-            let height = BlockHeight::from_u32(height);
-            if self.sapling_tree.store().get_checkpoint(&height)?.is_some() {
-                return Ok(Some(height));
-            }
-        }
-        Ok(None)
+        max_checkpointed_height(
+            self.sapling_tree.store(),
+            chain_tip_height,
+            min_confirmations,
+        )
     }
 
     #[cfg(feature = "orchard")]
@@ -717,16 +969,24 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
         chain_tip_height: BlockHeight,
         min_confirmations: NonZeroU32,
     ) -> Result<Option<BlockHeight>, Error> {
-        let max_checkpoint_height =
-            u32::from(chain_tip_height).saturating_sub(u32::from(min_confirmations) - 1);
-        // scan backward and find the first checkpoint that matches a blockheight prior to max_checkpoint_height
-        for height in (0..=max_checkpoint_height).rev() {
-            let height = BlockHeight::from_u32(height);
-            if self.orchard_tree.store().get_checkpoint(&height)?.is_some() {
-                return Ok(Some(height));
-            }
-        }
-        Ok(None)
+        max_checkpointed_height(
+            self.orchard_tree.store(),
+            chain_tip_height,
+            min_confirmations,
+        )
+    }
+
+    #[cfg(feature = "orchard")]
+    pub(crate) fn get_ironwood_max_checkpointed_height(
+        &self,
+        chain_tip_height: BlockHeight,
+        min_confirmations: NonZeroU32,
+    ) -> Result<Option<BlockHeight>, Error> {
+        max_checkpointed_height(
+            self.ironwood_tree.store(),
+            chain_tip_height,
+            min_confirmations,
+        )
     }
 
     /// Get the unscanned ranges from the scan queue and their corresponding sapling tree indices
@@ -769,7 +1029,7 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
     pub(crate) fn scan_complete(
         &mut self,
         range: Range<BlockHeight>,
-        wallet_note_positions: &[(ShieldedProtocol, Position)],
+        wallet_note_positions: &[(ShieldedPool, Position)],
     ) -> Result<(), Error> {
         let wallet_birthday = self.get_wallet_birthday()?;
 
@@ -782,14 +1042,16 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
             let mut required_sapling_subtrees = BTreeSet::new();
             #[cfg(feature = "orchard")]
             let mut required_orchard_subtrees = BTreeSet::new();
+            #[cfg(feature = "orchard")]
+            let mut required_ironwood_subtrees = BTreeSet::new();
             for (protocol, position) in wallet_note_positions {
                 match protocol {
-                    ShieldedProtocol::Sapling => {
+                    ShieldedPool::Sapling => {
                         required_sapling_subtrees.insert(
                             Address::above_position(SAPLING_SHARD_HEIGHT.into(), *position).index(),
                         );
                     }
-                    ShieldedProtocol::Orchard => {
+                    ShieldedPool::Orchard => {
                         #[cfg(feature = "orchard")]
                         required_orchard_subtrees.insert(
                             Address::above_position(ORCHARD_SHARD_HEIGHT.into(), *position).index(),
@@ -798,17 +1060,20 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
                         #[cfg(not(feature = "orchard"))]
                         return Err(Error::OrchardNotEnabled);
                     }
-                    // The in-memory backend scans only Sapling and Orchard outputs (see
-                    // `note_positions` construction in `put_blocks`), so it never records an
-                    // Ironwood (NU6.3) note position here.
-                    ShieldedProtocol::Ironwood => unreachable!(
-                        "the in-memory backend does not scan Ironwood note positions"
-                    ),
+                    ShieldedPool::Ironwood => {
+                        #[cfg(feature = "orchard")]
+                        required_ironwood_subtrees.insert(
+                            Address::above_position(ORCHARD_SHARD_HEIGHT.into(), *position).index(),
+                        );
+
+                        #[cfg(not(feature = "orchard"))]
+                        return Err(Error::OrchardNotEnabled);
+                    }
                 }
             }
 
             let extended_range = self.extend_range(
-                &ShieldedProtocol::Sapling,
+                &ShieldedPool::Sapling,
                 &range,
                 required_sapling_subtrees,
                 self.params.activation_height(NetworkUpgrade::Sapling),
@@ -818,10 +1083,21 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
             #[cfg(feature = "orchard")]
             let extended_range = self
                 .extend_range(
-                    &ShieldedProtocol::Orchard,
+                    &ShieldedPool::Orchard,
                     extended_range.as_ref().unwrap_or(&range),
                     required_orchard_subtrees,
                     self.params.activation_height(NetworkUpgrade::Nu5),
+                    wallet_birthday,
+                )?
+                .or(extended_range);
+
+            #[cfg(feature = "orchard")]
+            let extended_range = self
+                .extend_range(
+                    &ShieldedPool::Ironwood,
+                    extended_range.as_ref().unwrap_or(&range),
+                    required_ironwood_subtrees,
+                    self.params.activation_height(NetworkUpgrade::Nu6_3),
                     wallet_birthday,
                 )?
                 .or(extended_range);
@@ -861,7 +1137,7 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
     // given subtree indices, bounded by the wallet birthday and the fallback start height.
     fn extend_range(
         &self,
-        pool: &ShieldedProtocol,
+        pool: &ShieldedPool,
         range: &Range<BlockHeight>,
         required_subtree_indices: BTreeSet<u64>,
         fallback_start_height: Option<BlockHeight>,
@@ -875,11 +1151,11 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
 
         let shard_end = |index| -> Result<_, Error> {
             match pool {
-                ShieldedProtocol::Sapling => Ok(self
+                ShieldedPool::Sapling => Ok(self
                     .sapling_tree_shard_end_heights
                     .get(&Address::from_parts(SAPLING_SHARD_HEIGHT.into(), index))
                     .cloned()),
-                ShieldedProtocol::Orchard => {
+                ShieldedPool::Orchard => {
                     #[cfg(feature = "orchard")]
                     {
                         Ok(self
@@ -890,11 +1166,17 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
                     #[cfg(not(feature = "orchard"))]
                     panic!("Unsupported pool")
                 }
-                // `extend_range` is only ever invoked for the Sapling and Orchard pools; the
-                // in-memory backend maintains no Ironwood (NU6.3) shard-end height map.
-                ShieldedProtocol::Ironwood => unreachable!(
-                    "extend_range is not invoked for the Ironwood pool"
-                ),
+                ShieldedPool::Ironwood => {
+                    #[cfg(feature = "orchard")]
+                    {
+                        Ok(self
+                            .ironwood_tree_shard_end_heights
+                            .get(&Address::from_parts(ORCHARD_SHARD_HEIGHT.into(), index))
+                            .cloned())
+                    }
+                    #[cfg(not(feature = "orchard"))]
+                    panic!("Unsupported pool")
+                }
             }
         };
 
@@ -1020,14 +1302,58 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
         fully_scanned_height: &BlockHeight,
         chain_tip_height: &BlockHeight,
     ) -> Result<Option<Ratio<u64>>, Error> {
+        self.orchard_family_scan_progress(
+            orchard::ValuePool::Orchard,
+            birthday_height,
+            fully_scanned_height,
+            chain_tip_height,
+        )
+    }
+
+    #[cfg(feature = "orchard")]
+    pub(crate) fn ironwood_scan_progress(
+        &self,
+        birthday_height: &BlockHeight,
+        fully_scanned_height: &BlockHeight,
+        chain_tip_height: &BlockHeight,
+    ) -> Result<Option<Ratio<u64>>, Error> {
+        self.orchard_family_scan_progress(
+            orchard::ValuePool::Ironwood,
+            birthday_height,
+            fully_scanned_height,
+            chain_tip_height,
+        )
+    }
+
+    /// Scan progress for the Orchard or the Ironwood pool, which share the tree shape and
+    /// therefore the estimate; only the per-block counters and shard heights differ.
+    #[cfg(feature = "orchard")]
+    fn orchard_family_scan_progress(
+        &self,
+        pool: orchard::ValuePool,
+        birthday_height: &BlockHeight,
+        fully_scanned_height: &BlockHeight,
+        chain_tip_height: &BlockHeight,
+    ) -> Result<Option<Ratio<u64>>, Error> {
+        let action_count = |block: &MemoryWalletBlock| match pool {
+            orchard::ValuePool::Orchard => block.orchard_action_count.unwrap_or(0),
+            orchard::ValuePool::Ironwood => block.ironwood_action_count.unwrap_or(0),
+        };
+        let tree_size = |block: &MemoryWalletBlock| match pool {
+            orchard::ValuePool::Orchard => block.orchard_commitment_tree_size.unwrap_or(0),
+            orchard::ValuePool::Ironwood => block.ironwood_commitment_tree_size.unwrap_or(0),
+        };
+        let shard_end_heights = match pool {
+            orchard::ValuePool::Orchard => &self.orchard_tree_shard_end_heights,
+            orchard::ValuePool::Ironwood => &self.ironwood_tree_shard_end_heights,
+        };
+
         if fully_scanned_height == chain_tip_height {
             let outputs_sum = self
                 .blocks
                 .iter()
                 .filter(|(height, _)| height >= &birthday_height)
-                .fold(0, |sum, (_, block)| {
-                    sum + block.orchard_action_count.unwrap_or(0)
-                });
+                .fold(0, |sum, (_, block)| sum + action_count(block));
             Ok(Some(Ratio::new(
                 u64::from(outputs_sum),
                 u64::from(outputs_sum),
@@ -1040,7 +1366,16 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
                 .values()
                 .filter_map(|account| {
                     if account.birthday().height() == *birthday_height {
-                        Some(account.birthday().sapling_frontier().tree_size())
+                        Some(match pool {
+                            orchard::ValuePool::Orchard => {
+                                account.birthday().orchard_frontier().tree_size()
+                            }
+                            orchard::ValuePool::Ironwood => account
+                                .birthday()
+                                .prior_chain_state()
+                                .final_ironwood_tree()
+                                .tree_size(),
+                        })
                     } else {
                         None
                     }
@@ -1050,12 +1385,7 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
                     self.blocks
                         .iter()
                         .filter(|(height, _)| height <= &birthday_height)
-                        .map(|(_, block)| {
-                            u64::from(
-                                block.orchard_commitment_tree_size.unwrap_or(0)
-                                    - block.orchard_action_count.unwrap_or(0),
-                            )
-                        })
+                        .map(|(_, block)| u64::from(tree_size(block) - action_count(block)))
                         .max()
                 });
 
@@ -1065,7 +1395,7 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
                 .iter()
                 .filter(|(height, _)| height > &birthday_height)
                 .fold(0_u64, |acc, (_, block)| {
-                    acc + u64::from(block.orchard_action_count.unwrap_or(0))
+                    acc + u64::from(action_count(block))
                 });
 
             // We don't have complete information on how many outputs will exist in the shard at
@@ -1075,8 +1405,7 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
             // TODO: it would be nice to be able to reliably have the size of the commitment tree
             // at the chain tip without having to have scanned that block.
 
-            let shard_index_iter = self
-                .orchard_tree_shard_end_heights
+            let shard_index_iter = shard_end_heights
                 .iter()
                 .filter(|(_, height)| height > &birthday_height)
                 .map(|(address, _)| address.index());
@@ -1250,8 +1579,314 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
         &self.tx_table
     }
 
+    /// Iterates over the wallet's spend records: each received note that is known to be spent,
+    /// paired with the transaction that spends it. Spends are recorded both when the wallet
+    /// builds a transaction and when scanning detects one, so this covers transactions created
+    /// elsewhere with the same keys.
+    pub fn received_note_spends(&self) -> impl Iterator<Item = (&NoteId, &TxId)> + '_ {
+        self.received_note_spends.0.iter()
+    }
+
     /// Returns the block_time for a given block height, if the block is in the wallet's cache
     pub fn get_block_time(&self, height: BlockHeight) -> Option<u32> {
         self.blocks.get(&height).map(|block| block.block_time)
+    }
+
+    // Sync-state accessors, for applications that drive scanning and persistence themselves.
+
+    /// The lowest birthday height over all accounts, or `None` if the wallet has no accounts.
+    /// No block below it needs to be scanned.
+    pub fn wallet_birthday(&self) -> Option<BlockHeight> {
+        self.accounts
+            .values()
+            .map(|account| account.birthday().height())
+            .min()
+    }
+
+    /// The height up to which every block from the wallet birthday has been scanned, or `None`
+    /// if there is no such contiguous range yet (no accounts, nothing scanned, or a gap right
+    /// after the birthday). Notes below this height are complete; nothing above it is
+    /// guaranteed to be.
+    pub fn fully_scanned_height(&self) -> Result<Option<BlockHeight>, Error> {
+        Ok(self.block_fully_scanned()?.map(|meta| meta.block_height()))
+    }
+
+    /// The highest block height that has been scanned, or `None` if no block has been. Unlike
+    /// [`Self::fully_scanned_height`] this says nothing about the blocks below it.
+    pub fn max_scanned_height(&self) -> Option<BlockHeight> {
+        self.blocks.keys().max().copied()
+    }
+
+    /// The chain tip height the wallet was last told about through `update_chain_tip`, or
+    /// `None` before the first update.
+    pub fn chain_tip_height(&self) -> Result<Option<BlockHeight>, Error> {
+        self.chain_height()
+    }
+
+    /// The identity of every account in the wallet, in account id order.
+    pub fn account_identities(&self) -> Vec<AccountIdentity> {
+        self.accounts
+            .values()
+            .map(|account| {
+                let derivation = match account.kind() {
+                    AccountSource::Derived { derivation, .. } => Some(derivation),
+                    AccountSource::Imported {
+                        purpose: AccountPurpose::Spending { derivation },
+                        ..
+                    } => derivation.as_ref(),
+                    AccountSource::Imported {
+                        purpose: AccountPurpose::ViewOnly,
+                        ..
+                    } => None,
+                };
+                AccountIdentity {
+                    account_id: account.account_id(),
+                    ufvk: account.viewing_key().encode(&self.params),
+                    seed_fingerprint: derivation.map(|d| d.seed_fingerprint().to_bytes()),
+                    hd_index: derivation.map(|d| u32::from(d.account_index())),
+                    birthday_height: account.birthday().height(),
+                }
+            })
+            .collect()
+    }
+}
+
+/// Returns the greatest checkpoint height in `store` whose block has at least
+/// `min_confirmations` confirmations at `chain_tip_height`, or `None` if the tree has no such
+/// checkpoint.
+///
+/// Only the tree's checkpoints are visited, of which there are at most `max_checkpoints`. Probing
+/// every block height downwards from the tip would walk the whole chain whenever the tree has no
+/// checkpoints, which is the state of the Orchard tree before NU5 and of the Ironwood tree before
+/// NU6.3 or in a wallet restored from a snapshot taken before Ironwood support.
+fn max_checkpointed_height<H: Clone>(
+    store: &MemoryShardStore<H, BlockHeight>,
+    chain_tip_height: BlockHeight,
+    min_confirmations: NonZeroU32,
+) -> Result<Option<BlockHeight>, Error> {
+    let max_checkpoint_height = BlockHeight::from_u32(
+        u32::from(chain_tip_height).saturating_sub(u32::from(min_confirmations) - 1),
+    );
+    let mut result: Option<BlockHeight> = None;
+    store.for_each_checkpoint(store.checkpoint_count()?, |height, _| {
+        if *height <= max_checkpoint_height {
+            result = Some(result.map_or(*height, |r| r.max(*height)));
+        }
+        Ok(())
+    })?;
+    Ok(result)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PRUNING_DEPTH;
+    use zcash_client_backend::data_api::WalletWrite;
+    use zcash_protocol::consensus::Network;
+
+    fn sapling_nf(byte: u8) -> Nullifier {
+        Nullifier::Sapling(sapling::Nullifier([byte; 32]))
+    }
+
+    #[test]
+    fn empty_wallet_has_no_sync_state() {
+        let db = MemoryWalletDb::new(Network::TestNetwork, 100);
+        assert_eq!(db.wallet_birthday(), None);
+        assert_eq!(db.fully_scanned_height().unwrap(), None);
+        assert_eq!(db.max_scanned_height(), None);
+        assert_eq!(db.chain_tip_height().unwrap(), None);
+        assert!(db.account_identities().is_empty());
+    }
+
+    #[test]
+    fn wallet_summary_without_accounts_is_none_even_after_a_chain_tip() {
+        let mut db = MemoryWalletDb::new(Network::TestNetwork, 100);
+        assert!(
+            db.get_wallet_summary(ConfirmationsPolicy::MIN)
+                .unwrap()
+                .is_none()
+        );
+
+        // An empty wallet still records the chain tip (as an ignored range), which used to make
+        // the summary look up a wallet birthday that does not exist.
+        db.update_chain_tip(BlockHeight::from(1_000_000)).unwrap();
+        assert_eq!(
+            db.chain_tip_height().unwrap(),
+            Some(BlockHeight::from(1_000_000))
+        );
+        assert!(
+            db.get_wallet_summary(ConfirmationsPolicy::MIN)
+                .unwrap()
+                .is_none()
+        );
+    }
+
+    #[test]
+    fn mutate_marks_the_wallet_dirty_only_while_an_operation_runs() {
+        let mut db = MemoryWalletDb::new(Network::TestNetwork, 100);
+        assert_eq!(db.is_dirty(), None);
+
+        let seen = db
+            .mutate("op", |db| {
+                assert_eq!(db.is_dirty(), Some("op"));
+                Ok(7)
+            })
+            .unwrap();
+        assert_eq!(seen, 7);
+        assert_eq!(db.is_dirty(), None);
+    }
+
+    #[test]
+    fn a_failed_mutation_leaves_the_wallet_dirty_and_refuses_further_writes() {
+        let mut db = MemoryWalletDb::new(Network::TestNetwork, 100);
+        assert!(matches!(
+            db.mutate("first", |_| Err::<(), _>(Error::Other("boom".into()))),
+            Err(Error::Other(_))
+        ));
+        assert_eq!(db.is_dirty(), Some("first"));
+
+        // The next operation is refused before it runs, naming the one that failed.
+        let mut ran = false;
+        assert!(matches!(
+            db.mutate("second", |_| {
+                ran = true;
+                Ok(())
+            }),
+            Err(Error::DirtyState("first"))
+        ));
+        assert!(!ran);
+        assert_eq!(db.is_dirty(), Some("first"));
+    }
+
+    #[test]
+    fn a_dirty_wallet_refuses_to_encode() {
+        let mut db = MemoryWalletDb::new(Network::TestNetwork, 100);
+        let mut buf = vec![];
+        db.encode(&mut buf).unwrap();
+        assert!(!buf.is_empty());
+
+        let _ = db.mutate("put_blocks", |_| Err::<(), _>(Error::NonSequentialBlocks));
+        let mut buf = vec![];
+        assert!(matches!(
+            db.encode(&mut buf),
+            Err(Error::DirtyState("put_blocks"))
+        ));
+        assert!(buf.is_empty());
+        assert!(matches!(
+            db.encode_to_vec(),
+            Err(Error::DirtyState("put_blocks"))
+        ));
+    }
+
+    fn txid(byte: u8) -> TxId {
+        TxId::from_bytes([byte; 32])
+    }
+
+    /// Inserts one Sapling nullifier (and its transaction locator) per `(height, byte)` pair.
+    fn insert_sapling_entries(db: &mut MemoryWalletDb<Network>, entries: &[(u32, u8)]) {
+        for (height, byte) in entries {
+            db.insert_sapling_nullifier_map(
+                (*height).into(),
+                &[(
+                    TxIndex::from(*byte as u16),
+                    txid(*byte),
+                    vec![sapling::Nullifier([*byte; 32])],
+                )],
+            )
+            .unwrap();
+        }
+    }
+
+    fn locator_heights(db: &MemoryWalletDb<Network>) -> Vec<u32> {
+        db.tx_locator.0.keys().map(|(h, _)| u32::from(*h)).collect()
+    }
+
+    #[test]
+    fn prune_nullifier_map_below_keeps_entries_at_and_above_cutoff() {
+        let mut db = MemoryWalletDb::new(Network::TestNetwork, 100);
+        insert_sapling_entries(&mut db, &[(100, 1), (199, 2), (200, 3), (201, 4), (500, 5)]);
+        assert_eq!(db.nullifiers.0.len(), 5);
+        assert_eq!(db.tx_locator.0.len(), 5);
+
+        db.prune_nullifier_map_below(200.into());
+
+        assert!(db.nullifiers.get(&sapling_nf(1)).is_none());
+        assert!(db.nullifiers.get(&sapling_nf(2)).is_none());
+        assert_eq!(db.nullifiers.get(&sapling_nf(3)), Some(&(200.into(), 3)));
+        assert_eq!(db.nullifiers.get(&sapling_nf(4)), Some(&(201.into(), 4)));
+        assert_eq!(db.nullifiers.get(&sapling_nf(5)), Some(&(500.into(), 5)));
+        assert_eq!(locator_heights(&db), vec![200, 201, 500]);
+    }
+
+    #[test]
+    fn prune_nullifier_map_below_is_idempotent() {
+        let mut db = MemoryWalletDb::new(Network::TestNetwork, 100);
+        insert_sapling_entries(&mut db, &[(100, 1), (300, 2)]);
+
+        db.prune_nullifier_map_below(200.into());
+        let after_first = (db.nullifiers.clone(), db.tx_locator.clone());
+        db.prune_nullifier_map_below(200.into());
+
+        assert_eq!((db.nullifiers.clone(), db.tx_locator.clone()), after_first);
+        assert_eq!(locator_heights(&db), vec![300]);
+    }
+
+    #[test]
+    fn prune_nullifier_map_below_zero_keeps_everything() {
+        let mut db = MemoryWalletDb::new(Network::TestNetwork, 100);
+        insert_sapling_entries(&mut db, &[(0, 1), (100, 2)]);
+
+        db.prune_nullifier_map_below(0.into());
+
+        assert_eq!(db.nullifiers.0.len(), 2);
+        assert_eq!(locator_heights(&db), vec![0, 100]);
+    }
+
+    #[test]
+    #[cfg(feature = "orchard")]
+    fn prune_nullifier_map_below_prunes_orchard_entries() {
+        let mut db = MemoryWalletDb::new(Network::TestNetwork, 100);
+        let orchard_nf = |byte: u8| {
+            // `CtOption::unwrap` panics if the bytes are not a canonical field element.
+            orchard::note::Nullifier::from_bytes(&[byte; 32]).unwrap()
+        };
+        for (height, byte) in [(100u32, 1u8), (200, 2)] {
+            db.insert_orchard_nullifier_map(
+                height.into(),
+                &[(
+                    TxIndex::from(byte as u16),
+                    txid(byte),
+                    vec![orchard_nf(byte)],
+                )],
+            )
+            .unwrap();
+        }
+
+        db.prune_nullifier_map_below(200.into());
+
+        assert!(
+            db.nullifiers
+                .get(&Nullifier::Orchard(orchard_nf(1)))
+                .is_none()
+        );
+        assert_eq!(
+            db.nullifiers.get(&Nullifier::Orchard(orchard_nf(2))),
+            Some(&(200.into(), 2))
+        );
+        assert_eq!(locator_heights(&db), vec![200]);
+    }
+
+    #[test]
+    fn prune_tracked_nullifiers_is_a_noop_without_a_fully_scanned_height() {
+        // A wallet with no accounts has no birthday, hence no fully scanned height, so there is
+        // no safe cutoff and nothing may be pruned.
+        let mut db = MemoryWalletDb::new(Network::TestNetwork, 100);
+        insert_sapling_entries(&mut db, &[(0, 1), (1_000, 2), (1_000_000, 3)]);
+        assert!(db.block_fully_scanned().unwrap().is_none());
+
+        db.prune_tracked_nullifiers(PRUNING_DEPTH).unwrap();
+
+        assert_eq!(db.nullifiers.0.len(), 3);
+        assert_eq!(locator_heights(&db), vec![0, 1_000, 1_000_000]);
     }
 }

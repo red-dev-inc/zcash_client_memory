@@ -11,16 +11,17 @@ use zcash_primitives::transaction::TxId;
 use zcash_protocol::{PoolType, ShieldedPool::Sapling, memo::Memo};
 
 use zcash_client_backend::{
+    DecryptedOutput,
     data_api::{ReceivedNotes, SentTransactionOutput},
     wallet::{Note, NoteId, Recipient, WalletSaplingOutput},
-    DecryptedOutput,
 };
 
 use crate::AccountId;
 
 #[cfg(feature = "orchard")]
 use {
-    zcash_client_backend::wallet::WalletOrchardOutput, zcash_protocol::ShieldedPool::Orchard,
+    crate::types::notes::shielded_protocol_for_value_pool,
+    zcash_client_backend::wallet::WalletOrchardOutput,
 };
 
 use crate::{Nullifier, error::Error};
@@ -84,16 +85,22 @@ pub struct ReceivedNote {
 }
 impl ReceivedNote {
     pub fn pool(&self) -> PoolType {
-        match self.note {
-            Note::Sapling { .. } => PoolType::SAPLING,
-            #[cfg(feature = "orchard")]
-            Note::Orchard { .. } => PoolType::ORCHARD,
-        }
+        PoolType::Shielded(self.note.pool())
     }
     pub fn account_id(&self) -> AccountId {
         self.account_id
     }
-    pub fn nullifier(&self) -> Option<&Nullifier> {
+    /// Whether this note was recorded as change of a transaction the wallet built, or was
+    /// found alongside a spend from the same account while scanning.
+    pub fn is_change(&self) -> bool {
+        self.is_change
+    }
+    /// The key scope the note was received under, when known. `Scope::Internal` marks change
+    /// even for notes whose `is_change` flag was not set at the time they were recorded.
+    pub fn recipient_key_scope(&self) -> Option<Scope> {
+        self.recipient_key_scope
+    }
+    pub(crate) fn nullifier(&self) -> Option<&Nullifier> {
         self.nf.as_ref()
     }
     pub fn txid(&self) -> TxId {
@@ -138,7 +145,11 @@ impl ReceivedNote {
                 }),
                 #[cfg(feature = "orchard")]
                 Note::Orchard { note, pool } => Ok(ReceivedNote {
-                    note_id: NoteId::new(txid, Orchard, output.output_index() as u16),
+                    note_id: NoteId::new(
+                        txid,
+                        shielded_protocol_for_value_pool(*pool),
+                        output.output_index() as u16,
+                    ),
                     txid,
                     output_index: output.output_index() as u32,
                     account_id: *receiving_account,
@@ -179,23 +190,23 @@ impl ReceivedNote {
             recipient_key_scope: output.recipient_key_scope(),
         }
     }
+    /// Builds a received note from a scanned Orchard-family output, whether it was found in the
+    /// Orchard or the Ironwood pool; the note identifier's protocol and the nullifier's pool tag
+    /// follow the output's value pool.
     #[cfg(feature = "orchard")]
     pub fn from_wallet_orchard_output(
         note_id: NoteId,
         output: &WalletOrchardOutput<AccountId>,
     ) -> Self {
+        let (note, pool) = *output.note();
+        debug_assert_eq!(note_id.protocol(), shielded_protocol_for_value_pool(pool));
         ReceivedNote {
             note_id,
             txid: *note_id.txid(),
             output_index: output.index() as u32,
             account_id: *output.account_id(),
-            // A `WalletOrchardOutput` now carries a (note, value_pool) tuple; preserve the value
-            // pool recorded for the output.
-            note: Note::Orchard {
-                note: output.note().0,
-                pool: output.note().1,
-            },
-            nf: output.nf().map(|nf| Nullifier::Orchard(*nf)),
+            note: Note::Orchard { note, pool },
+            nf: output.nf().map(|nf| Nullifier::orchard_family(pool, *nf)),
             is_change: output.is_change(),
             memo: Memo::Empty,
             commitment_tree_position: Some(output.note_commitment_tree_position()),
@@ -220,7 +231,7 @@ impl ReceivedNote {
             output_index: output.index() as u32,
             account_id: *output.account(),
             note: Note::Sapling(output.note().clone()),
-            nf: None, // Nullifier not yet known for incoming unspent notes
+            nf: None,         // Nullifier not yet known for incoming unspent notes
             is_change: false, // Incoming notes are not change
             memo,
             commitment_tree_position: None, // Position not yet known
@@ -228,16 +239,22 @@ impl ReceivedNote {
         })
     }
 
-    /// Creates a ReceivedNote from a decrypted Orchard output (for incoming transactions).
+    /// Creates a ReceivedNote from a decrypted Orchard-family output (for incoming transactions).
     ///
-    /// This is used when syncing discovers a new incoming Orchard note that was
-    /// received to one of the wallet's external addresses.
+    /// This is used when syncing discovers a new incoming Orchard or Ironwood note that was
+    /// received to one of the wallet's external addresses; the value pool recorded by trial
+    /// decryption decides which.
     #[cfg(feature = "orchard")]
     pub fn from_decrypted_orchard_output(
         txid: TxId,
         output: &DecryptedOutput<(orchard::Note, orchard::ValuePool), AccountId>,
     ) -> Result<Self, Error> {
-        let note_id = NoteId::new(txid, Orchard, output.index() as u16);
+        let (note, pool) = *output.note();
+        let note_id = NoteId::new(
+            txid,
+            shielded_protocol_for_value_pool(pool),
+            output.index() as u16,
+        );
         let memo = Memo::try_from(output.memo().clone())?;
 
         Ok(ReceivedNote {
@@ -245,13 +262,8 @@ impl ReceivedNote {
             txid,
             output_index: output.index() as u32,
             account_id: *output.account(),
-            // Orchard-family decrypted outputs carry a (note, value_pool) tuple; preserve the
-            // value pool recorded by trial decryption.
-            note: Note::Orchard {
-                note: output.note().0,
-                pool: output.note().1,
-            },
-            nf: None, // Nullifier not yet known for incoming unspent notes
+            note: Note::Orchard { note, pool },
+            nf: None,         // Nullifier not yet known for incoming unspent notes
             is_change: false, // Incoming notes are not change
             memo,
             commitment_tree_position: None, // Position not yet known
@@ -260,20 +272,35 @@ impl ReceivedNote {
     }
 }
 
-impl From<ReceivedNote>
+impl TryFrom<ReceivedNote>
     for zcash_client_backend::wallet::ReceivedNote<NoteId, zcash_client_backend::wallet::Note>
 {
-    fn from(value: ReceivedNote) -> Self {
-        zcash_client_backend::wallet::ReceivedNote::from_parts(
+    type Error = Error;
+
+    /// Fails for a note whose key scope or commitment tree position is not yet known (one found
+    /// by decrypting an unmined transaction rather than by scanning), since the backend's note
+    /// type requires both.
+    fn try_from(value: ReceivedNote) -> Result<Self, Error> {
+        Ok(zcash_client_backend::wallet::ReceivedNote::from_parts(
             value.note_id,
             value.txid,
-            value.output_index.try_into().unwrap(),
+            value.output_index.try_into()?,
             value.note,
-            value.recipient_key_scope.unwrap(),
-            value.commitment_tree_position.unwrap(),
+            value
+                .recipient_key_scope
+                .ok_or(Error::Missing("recipient key scope".into()))?,
+            value
+                .commitment_tree_position
+                .ok_or(Error::Missing("commitment tree position".into()))?,
             None,
             None,
-        )
+        ))
+    }
+}
+
+impl Default for ReceivedNoteTable {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -327,6 +354,19 @@ impl ReceivedNoteTable {
         })
     }
 
+    #[cfg(feature = "orchard")]
+    pub fn get_ironwood_nullifiers(
+        &self,
+    ) -> impl Iterator<Item = (AccountId, TxId, orchard::note::Nullifier)> + '_ {
+        self.notes.iter().filter_map(|entry| {
+            if let Some(Nullifier::Ironwood(nf)) = entry.nullifier() {
+                Some((entry.account_id(), entry.txid(), *nf))
+            } else {
+                None
+            }
+        })
+    }
+
     pub fn insert_received_note(&mut self, note: ReceivedNote) {
         // Check if note_id already exists via the index (O(1) lookup)
         if let Some(&idx) = self.note_id_index.get(&note.note_id) {
@@ -336,8 +376,9 @@ impl ReceivedNoteTable {
             let old_nf = existing.nf;
             existing.nf = note.nf.or(existing.nf);
             existing.is_change = note.is_change || existing.is_change;
-            existing.commitment_tree_position =
-                note.commitment_tree_position.or(existing.commitment_tree_position);
+            existing.commitment_tree_position = note
+                .commitment_tree_position
+                .or(existing.commitment_tree_position);
             // Update nullifier index if it changed
             if existing.nf != old_nf {
                 if let Some(old) = old_nf {
@@ -383,6 +424,21 @@ impl ReceivedNoteTable {
         Ok(acc)
     }
 
+    #[cfg(feature = "orchard")]
+    pub fn detect_ironwood_spending_accounts<'a>(
+        &self,
+        nfs: impl Iterator<Item = &'a orchard::note::Nullifier>,
+    ) -> Result<BTreeSet<AccountId>, Error> {
+        let mut acc = BTreeSet::new();
+        for nf in nfs {
+            let key = Nullifier::Ironwood(*nf);
+            if let Some(note) = self.find_by_nullifier(&key) {
+                acc.insert(note.account_id());
+            }
+        }
+        Ok(acc)
+    }
+
     pub fn detect_sapling_spending_accounts<'a>(
         &self,
         nfs: impl Iterator<Item = &'a sapling::Nullifier>,
@@ -415,6 +471,7 @@ impl DerefMut for ReceivedNoteTable {
 pub(crate) fn to_spendable_notes(
     sapling_received_notes: &[&ReceivedNote],
     #[cfg(feature = "orchard")] orchard_received_notes: &[&ReceivedNote],
+    #[cfg(feature = "orchard")] ironwood_received_notes: &[&ReceivedNote],
 ) -> Result<ReceivedNotes<NoteId>, Error> {
     let sapling = sapling_received_notes
         .iter()
@@ -440,36 +497,43 @@ pub(crate) fn to_spendable_notes(
         .collect::<Result<Vec<_>, _>>()?;
 
     #[cfg(feature = "orchard")]
-    let orchard = orchard_received_notes
-        .iter()
-        .map(|note| {
-            if let Note::Orchard { note: inner, .. } = &note.note {
-                Ok(zcash_client_backend::wallet::ReceivedNote::from_parts(
-                    note.note_id,
-                    note.txid(),
-                    note.output_index.try_into().unwrap(), // this overflow can never happen or else the chain is broken
-                    *inner,
-                    note.recipient_key_scope
-                        .ok_or(Error::Missing("recipient key scope".into()))?,
-                    note.commitment_tree_position
-                        .ok_or(Error::Missing("commitment tree position".into()))?,
-                    None,
-                    None,
-                ))
-            } else {
-                Err(Error::Other("Note is not an orchard note".to_owned()))
-            }
-        })
-        .collect::<Result<Vec<_>, _>>()?;
+    let orchard_family = |notes: &[&ReceivedNote], pool: orchard::ValuePool| {
+        notes
+            .iter()
+            .map(|note| match &note.note {
+                Note::Orchard {
+                    note: inner,
+                    pool: note_pool,
+                } if *note_pool == pool => {
+                    Ok(zcash_client_backend::wallet::ReceivedNote::from_parts(
+                        note.note_id,
+                        note.txid(),
+                        note.output_index.try_into().unwrap(), // this overflow can never happen or else the chain is broken
+                        *inner,
+                        note.recipient_key_scope
+                            .ok_or(Error::Missing("recipient key scope".into()))?,
+                        note.commitment_tree_position
+                            .ok_or(Error::Missing("commitment tree position".into()))?,
+                        None,
+                        None,
+                    ))
+                }
+                _ => Err(Error::Other(format!("Note is not an {pool:?} note"))),
+            })
+            .collect::<Result<Vec<_>, _>>()
+    };
+
+    #[cfg(feature = "orchard")]
+    let orchard = orchard_family(orchard_received_notes, orchard::ValuePool::Orchard)?;
+    #[cfg(feature = "orchard")]
+    let ironwood = orchard_family(ironwood_received_notes, orchard::ValuePool::Ironwood)?;
 
     Ok(ReceivedNotes::new(
         sapling,
         #[cfg(feature = "orchard")]
         orchard,
-        // The in-memory backend does not track Ironwood (NU6.3) notes, so there are none to
-        // return as spendable inputs.
         #[cfg(feature = "orchard")]
-        Vec::new(),
+        ironwood,
     ))
 }
 
@@ -483,10 +547,9 @@ mod tests {
 
     /// Known-valid sapling PaymentAddress bytes (from mod.rs serialization test).
     const VALID_PA_BYTES: [u8; 43] = [
-        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x8e, 0x11,
-        0x9d, 0x72, 0x99, 0x2b, 0x56, 0x0d, 0x26, 0x50, 0xff, 0xe0, 0xbe, 0x7f, 0x35, 0x42,
-        0xfd, 0x97, 0x00, 0x3c, 0xb7, 0xcc, 0x3a, 0xbf, 0xf8, 0x1a, 0x7f, 0x90, 0x37, 0xf3,
-        0xea,
+        0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x00, 0x30, 0x8e, 0x11, 0x9d,
+        0x72, 0x99, 0x2b, 0x56, 0x0d, 0x26, 0x50, 0xff, 0xe0, 0xbe, 0x7f, 0x35, 0x42, 0xfd, 0x97,
+        0x00, 0x3c, 0xb7, 0xcc, 0x3a, 0xbf, 0xf8, 0x1a, 0x7f, 0x90, 0x37, 0xf3, 0xea,
     ];
 
     fn make_test_note(
@@ -503,9 +566,8 @@ mod tests {
             sapling::value::NoteValue::from_raw(1000),
             sapling::Rseed::AfterZip212([0; 32]),
         );
-        let nf = nullifier_bytes.map(|b| {
-            Nullifier::Sapling(sapling::Nullifier::from_slice(&[b; 32]).unwrap())
-        });
+        let nf = nullifier_bytes
+            .map(|b| Nullifier::Sapling(sapling::Nullifier::from_slice(&[b; 32]).unwrap()));
 
         ReceivedNote {
             note_id,
@@ -664,16 +726,16 @@ mod tests {
 
 mod serialization {
     use super::*;
-    use crate::{proto::memwallet as proto, read_optional};
+    use crate::{error::proto_enum, proto::memwallet as proto, read_optional};
 
-    impl From<ReceivedNote> for proto::ReceivedNote {
-        fn from(value: ReceivedNote) -> Self {
+    impl From<&ReceivedNote> for proto::ReceivedNote {
+        fn from(value: &ReceivedNote) -> Self {
             Self {
                 note_id: Some(value.note_id.into()),
                 tx_id: Some(value.txid.into()),
                 output_index: value.output_index,
                 account_id: *value.account_id,
-                note: Some(value.note.into()),
+                note: Some((&value.note).into()),
                 nullifier: value.nf.map(|nf| nf.into()),
                 is_change: value.is_change,
                 memo: value.memo.encode().as_array().to_vec(),
@@ -696,16 +758,22 @@ mod serialization {
                 txid: read_optional!(value, tx_id)?.try_into()?,
                 output_index: value.output_index,
                 account_id: value.account_id.into(),
-                note: read_optional!(value, note)?.into(),
+                note: read_optional!(value, note)?.try_into()?,
                 nf: value.nullifier.map(|nf| nf.try_into()).transpose()?,
                 is_change: value.is_change,
                 memo: Memo::from_bytes(&value.memo)?,
                 commitment_tree_position: value.commitment_tree_position.map(|pos| pos.into()),
-                recipient_key_scope: match value.recipient_key_scope {
-                    Some(0) => Some(Scope::Internal),
-                    Some(1) => Some(Scope::External),
-                    _ => None,
-                },
+                recipient_key_scope: value
+                    .recipient_key_scope
+                    .map(|scope| {
+                        Ok::<_, Error>(
+                            match proto_enum::<proto::Scope>("recipient_key_scope", scope)? {
+                                proto::Scope::Internal => Scope::Internal,
+                                proto::Scope::External => Scope::External,
+                            },
+                        )
+                    })
+                    .transpose()?,
             })
         }
     }

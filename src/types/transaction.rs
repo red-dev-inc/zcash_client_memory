@@ -69,6 +69,9 @@ impl TransactionEntry {
         }
     }
 
+    /// The transaction's index within its block, if known. Read by the transparent coinbase
+    /// filter, which treats index 0 as coinbase.
+    #[cfg(feature = "transparent-inputs")]
     pub(crate) fn tx_index(&self) -> Option<u32> {
         self.tx_index
     }
@@ -109,16 +112,6 @@ impl TransactionTable {
 
     pub(crate) fn get_transaction(&self, txid: &TxId) -> Option<&TransactionEntry> {
         self.0.get(txid)
-    }
-
-    pub(crate) fn get_by_height_and_index(
-        &self,
-        height: BlockHeight,
-        index: u32,
-    ) -> Option<&TransactionEntry> {
-        self.0
-            .values()
-            .find(|entry| entry.block == Some(height) && entry.tx_index == Some(index))
     }
 
     /// Inserts information about a MINED transaction that was observed to
@@ -266,10 +259,10 @@ impl TxLocatorMap {
 
 mod serialization {
     use super::*;
-    use crate::{proto::memwallet as proto, read_optional};
+    use crate::{error::proto_enum, proto::memwallet as proto, read_optional};
 
-    impl From<TransactionEntry> for proto::TransactionEntry {
-        fn from(entry: TransactionEntry) -> Self {
+    impl From<&TransactionEntry> for proto::TransactionEntry {
+        fn from(entry: &TransactionEntry) -> Self {
             Self {
                 tx_status: match entry.tx_status {
                     TransactionStatus::TxidNotRecognized => {
@@ -283,7 +276,7 @@ mod serialization {
                 block: entry.block.map(Into::into),
                 tx_index: entry.tx_index,
                 expiry_height: entry.expiry_height.map(Into::into),
-                raw_tx: entry.raw,
+                raw_tx: entry.raw.clone(),
                 fee: entry.fee.map(Into::into),
                 target_height: entry._target_height.map(Into::into),
                 mined_height: match entry.tx_status {
@@ -298,8 +291,9 @@ mod serialization {
         type Error = Error;
 
         fn try_from(entry: proto::TransactionEntry) -> Result<Self, Self::Error> {
+            let tx_status = proto_enum::<proto::TransactionStatus>("tx_status", entry.tx_status)?;
             Ok(Self {
-                tx_status: match entry.tx_status() {
+                tx_status: match tx_status {
                     proto::TransactionStatus::TxidNotRecognized => {
                         TransactionStatus::TxidNotRecognized
                     }
