@@ -48,6 +48,9 @@ pub enum PoolType {
     Transparent = 0,
     ShieldedSapling = 1,
     ShieldedOrchard = 2,
+    /// The Ironwood pool (NU6.3). Its notes and nullifiers are Orchard-shaped but it is a
+    /// distinct pool with its own note commitment tree.
+    ShieldedIronwood = 3,
 }
 impl PoolType {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -59,6 +62,7 @@ impl PoolType {
             Self::Transparent => "Transparent",
             Self::ShieldedSapling => "ShieldedSapling",
             Self::ShieldedOrchard => "ShieldedOrchard",
+            Self::ShieldedIronwood => "ShieldedIronwood",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -67,6 +71,7 @@ impl PoolType {
             "Transparent" => Some(Self::Transparent),
             "ShieldedSapling" => Some(Self::ShieldedSapling),
             "ShieldedOrchard" => Some(Self::ShieldedOrchard),
+            "ShieldedIronwood" => Some(Self::ShieldedIronwood),
             _ => None,
         }
     }
@@ -76,6 +81,7 @@ impl PoolType {
 pub enum ShieldedProtocol {
     Sapling = 0,
     Orchard = 1,
+    Ironwood = 2,
 }
 impl ShieldedProtocol {
     /// String value of the enum field names used in the ProtoBuf definition.
@@ -86,6 +92,7 @@ impl ShieldedProtocol {
         match self {
             Self::Sapling => "sapling",
             Self::Orchard => "orchard",
+            Self::Ironwood => "ironwood",
         }
     }
     /// Creates an enum from field names used in the ProtoBuf definition.
@@ -93,6 +100,7 @@ impl ShieldedProtocol {
         match value {
             "sapling" => Some(Self::Sapling),
             "orchard" => Some(Self::Orchard),
+            "ironwood" => Some(Self::Ironwood),
             _ => None,
         }
     }
@@ -138,6 +146,10 @@ pub struct Note {
     pub rho: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
     #[prost(message, optional, tag = "5")]
     pub rseed: ::core::option::Option<RSeed>,
+    /// Orchard-family note plaintext version lead byte (2 for Orchard, 3 for Ironwood). Notes
+    /// saved before this field existed are Orchard-pool notes and decode as version 2.
+    #[prost(uint32, optional, tag = "6")]
+    pub note_version: ::core::option::Option<u32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct RSeed {
@@ -329,12 +341,20 @@ pub struct TreeShard {
     pub shard_data: ::prost::alloc::vec::Vec<u8>,
 }
 /// A checkpoint in a shard tree
-#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TreeCheckpoint {
     #[prost(uint32, tag = "1")]
     pub checkpoint_id: u32,
+    /// The position of the checkpointed leaf. Meaningless when `tree_empty` is set.
     #[prost(uint64, tag = "2")]
     pub position: u64,
+    /// Set for a checkpoint of the empty tree. Blobs written before this field existed
+    /// stored such checkpoints as position 0; they decode as before, at position 0.
+    #[prost(bool, tag = "3")]
+    pub tree_empty: bool,
+    /// The positions whose marks were removed as of this checkpoint.
+    #[prost(uint64, repeated, tag = "4")]
+    pub marks_removed: ::prost::alloc::vec::Vec<u64>,
 }
 /// Stores the block height corresponding to the last note commitment in a shard
 /// as defined by its level and index in the tree
@@ -452,6 +472,39 @@ pub struct MemoryWallet {
     /// Queue of transaction data requests the wallet should make to the lightwalletd provided to obtain more complete information
     #[prost(message, repeated, tag = "18")]
     pub transaction_data_requests: ::prost::alloc::vec::Vec<TransactionDataRequest>,
+    /// Ironwood shielded pool shard tree (NU6.3). Absent in wallets saved before Ironwood support,
+    /// which decode to an empty tree.
+    #[prost(message, optional, tag = "19")]
+    pub ironwood_tree: ::core::option::Option<ShardTree>,
+    /// the block heights corresponding to the last note commitment for each shard in the ironwood tree
+    #[prost(message, repeated, tag = "20")]
+    pub ironwood_tree_shard_end_heights: ::prost::alloc::vec::Vec<TreeEndHeightsRecord>,
+    /// Totals of the per-block output and action counts over the run of fully scanned heights whose
+    /// block records may have been pruned. Absent in wallets saved before block pruning, which
+    /// compute it from their (complete) block records on decode.
+    #[prost(message, optional, tag = "21")]
+    pub scan_counters: ::core::option::Option<ScanCounters>,
+}
+/// Running totals of the per-block Sapling output and Orchard and Ironwood action counts over the
+/// contiguous run of heights (counted_above, counted_through]. The wallet prunes the block records
+/// of those heights and reports scan progress from these totals instead.
+#[derive(Clone, Copy, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct ScanCounters {
+    /// exclusive lower bound of the counted heights
+    #[prost(uint32, tag = "1")]
+    pub counted_above: u32,
+    /// inclusive upper bound of the counted heights
+    #[prost(uint32, tag = "2")]
+    pub counted_through: u32,
+    /// Sapling outputs in the counted blocks
+    #[prost(uint64, tag = "3")]
+    pub sapling_outputs: u64,
+    /// Orchard actions in the counted blocks
+    #[prost(uint64, tag = "4")]
+    pub orchard_actions: u64,
+    /// Ironwood actions in the counted blocks
+    #[prost(uint64, tag = "5")]
+    pub ironwood_actions: u64,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct Accounts {
@@ -551,6 +604,10 @@ pub struct ChainState {
     pub final_sapling_tree: ::prost::alloc::vec::Vec<u8>,
     #[prost(bytes = "vec", tag = "4")]
     pub final_orchard_tree: ::prost::alloc::vec::Vec<u8>,
+    /// the Ironwood (NU6.3) note commitment tree frontier; empty for chain states saved before
+    /// Ironwood support, which decode to the empty frontier
+    #[prost(bytes = "vec", tag = "5")]
+    pub final_ironwood_tree: ::prost::alloc::vec::Vec<u8>,
 }
 #[derive(Clone, PartialEq, ::prost::Message)]
 pub struct WalletBlock {
@@ -581,6 +638,12 @@ pub struct WalletBlock {
     /// the number of Orchard actions in this block
     #[prost(uint32, optional, tag = "9")]
     pub orchard_action_count: ::core::option::Option<u32>,
+    /// the size of the Ironwood note commitment tree as of the end of this block
+    #[prost(uint32, optional, tag = "10")]
+    pub ironwood_commitment_tree_size: ::core::option::Option<u32>,
+    /// the number of Ironwood actions in this block
+    #[prost(uint32, optional, tag = "11")]
+    pub ironwood_action_count: ::core::option::Option<u32>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct TransactionEntry {
@@ -754,4 +817,83 @@ impl ScanPriority {
             _ => None,
         }
     }
+}
+/// The header of a format v2 wallet blob. It describes the wallet body that follows it well
+/// enough for an application to recognise, verify and compare saved blobs without decoding
+/// the body.
+///
+/// Wire layout of a v2 blob:
+///
+///    magic         b"ZMWD" (4 bytes)
+///    header_len    u32, little endian
+///    WalletMeta    header_len bytes
+///    MemoryWallet  the body (MemoryWallet.version = 2), body_len bytes
+///
+/// A v1 blob is a bare MemoryWallet with version = 1. Its first bytes are 0x08 0x01 (field 1,
+/// varint, value 1), so the magic can never be mistaken for one.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct WalletMeta {
+    /// the version of the blob format this header belongs to: 2
+    #[prost(uint32, tag = "1")]
+    pub schema_version: u32,
+    /// the network the wallet was saved for: "main", "test" or "regtest"
+    #[prost(string, tag = "2")]
+    pub network: ::prost::alloc::string::String,
+    /// Unix time in milliseconds of the first save of this wallet lineage; preserved across saves
+    #[prost(uint64, tag = "3")]
+    pub created_at_ms: u64,
+    /// Unix time in milliseconds of this save
+    #[prost(uint64, tag = "4")]
+    pub saved_at_ms: u64,
+    /// the identifier of the application instance that wrote this blob
+    #[prost(string, tag = "5")]
+    pub writer_id: ::prost::alloc::string::String,
+    /// incremented on every save of this lineage, starting at 1
+    #[prost(uint64, tag = "6")]
+    pub save_seq: u64,
+    /// the lowest account birthday height; absent when the wallet has no accounts
+    #[prost(uint32, optional, tag = "7")]
+    pub birthday_height: ::core::option::Option<u32>,
+    /// the height up to which every block from the birthday has been scanned, when known
+    #[prost(uint32, optional, tag = "8")]
+    pub fully_scanned_height: ::core::option::Option<u32>,
+    /// the highest scanned block height, when any block has been scanned
+    #[prost(uint32, optional, tag = "9")]
+    pub max_scanned_height: ::core::option::Option<u32>,
+    /// the chain tip height the wallet was last told about, when any
+    #[prost(uint32, optional, tag = "10")]
+    pub chain_tip_height: ::core::option::Option<u32>,
+    /// the number of accounts in the wallet
+    #[prost(uint32, tag = "11")]
+    pub account_count: u32,
+    /// the encoded unified full viewing key of every account, in account id order
+    #[prost(string, repeated, tag = "12")]
+    pub account_ufvks: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// the ZIP 32 seed fingerprint of account 0, when known
+    #[prost(bytes = "vec", optional, tag = "13")]
+    pub seed_fingerprint: ::core::option::Option<::prost::alloc::vec::Vec<u8>>,
+    /// SHA-256 of the body bytes; empty when the header was built without a body
+    #[prost(bytes = "vec", tag = "14")]
+    pub body_sha256: ::prost::alloc::vec::Vec<u8>,
+    /// the length of the body in bytes; zero when the header was built without a body
+    #[prost(uint64, tag = "15")]
+    pub body_len: u64,
+    /// the number of block records the body carries
+    #[prost(uint32, tag = "16")]
+    pub blocks_retained: u32,
+}
+/// The subset of a v1 MemoryWallet that describes the wallet. Decoding a v1 blob as this
+/// message skips every other field (blocks, notes, trees), so it costs nothing proportional to
+/// the wallet's history. The tags match MemoryWallet.
+#[derive(Clone, PartialEq, ::prost::Message)]
+pub struct LegacyPeek {
+    /// the version of the wallet serialization format
+    #[prost(uint32, tag = "1")]
+    pub version: u32,
+    /// the accounts in this wallet
+    #[prost(message, optional, tag = "2")]
+    pub accounts: ::core::option::Option<Accounts>,
+    /// the scan queue, from which the chain tip is read
+    #[prost(message, repeated, tag = "10")]
+    pub scan_queue: ::prost::alloc::vec::Vec<ScanQueueRecord>,
 }

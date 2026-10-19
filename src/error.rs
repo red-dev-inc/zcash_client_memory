@@ -26,6 +26,19 @@ macro_rules! read_optional {
     };
 }
 
+/// Decodes a protobuf enumeration field, rejecting values this build does not know.
+///
+/// The prost-generated accessors (`record.priority()` and the like) silently map an unknown
+/// integer to the enum's zero variant, which would turn a blob written by a newer version of this
+/// crate into quietly wrong state. Decoding must fail loudly instead.
+pub(crate) fn proto_enum<T: TryFrom<i32, Error = prost::UnknownEnumValue>>(
+    field: &'static str,
+    value: i32,
+) -> Result<T> {
+    T::try_from(value)
+        .map_err(|prost::UnknownEnumValue(value)| Error::UnknownEnumValue { field, value })
+}
+
 #[derive(Debug, thiserror::Error)]
 pub enum Error {
     #[error("Account not found: {0:?}")]
@@ -48,8 +61,14 @@ pub enum Error {
     ByteVecToArrayConversion(Vec<u8>),
     #[error("Chain height unknown")]
     ChainHeightUnknown,
+    #[error("Wallet blob checksum mismatch: the body does not hash to the digest in its header")]
+    ChecksumMismatch,
     #[error("Conflicting Tx Locator map entry")]
     ConflictingTxLocator,
+    #[error(
+        "Wallet state is dirty: `{0}` failed part-way, so the in-memory state is inconsistent and must not be persisted or written to; rebuild it from the last good encoding"
+    )]
+    DirtyState(&'static str),
     #[error("Corrupted Data: {0}")]
     CorruptedData(String),
     #[error("Error deriving key: {0}")]
@@ -70,6 +89,8 @@ pub enum Error {
     Missing(String),
     #[error("Note not found")]
     NoteNotFound,
+    #[error("Wallet blob was saved for network `{found}`, but this wallet is for `{expected}`")]
+    NetworkMismatch { expected: String, found: String },
     #[error("Blocks are non sequental")]
     NonSequentialBlocks,
     #[error("Orchard specific code was called without the 'orchard' feature enabled")]
@@ -100,6 +121,8 @@ pub enum Error {
     TransparentDerivation(bip32::Error),
     #[error("Unsupported proto version: {1} (expected {0})")]
     UnsupportedProtoVersion(u32, u32),
+    #[error("Unknown value {value} for proto enum field {field}")]
+    UnknownEnumValue { field: &'static str, value: i32 },
     #[error("Error converting nullifier from slice: {0}")]
     NullifierFromSlice(#[from] TryFromSliceError),
     #[error("Error decoding ufvk string: {0}")]

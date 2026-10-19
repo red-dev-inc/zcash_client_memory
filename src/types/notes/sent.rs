@@ -9,9 +9,6 @@ use zcash_protocol::{PoolType, ShieldedPool::Sapling, TxId, memo::Memo, value::Z
 
 use crate::AccountId;
 
-#[cfg(feature = "orchard")]
-use zcash_protocol::ShieldedPool::Orchard;
-
 #[derive(PartialEq, PartialOrd, Eq, Ord, Debug, Clone)]
 pub enum SentNoteId {
     Shielded(NoteId),
@@ -41,6 +38,12 @@ impl SentNoteId {
 
 #[derive(Debug, Clone, PartialEq)]
 pub struct SentNoteTable(pub(crate) BTreeMap<SentNoteId, SentNote>);
+
+impl Default for SentNoteTable {
+    fn default() -> Self {
+        Self::new()
+    }
+}
 
 impl SentNoteTable {
     pub fn new() -> Self {
@@ -187,9 +190,13 @@ impl SentNote {
 
 mod serialization {
     use super::*;
-    use crate::{error::Error, proto::memwallet as proto, read_optional};
+    use crate::{
+        error::{Error, proto_enum},
+        proto::memwallet as proto,
+        read_optional,
+    };
     use zcash_address::ZcashAddress;
-    use zcash_protocol::ShieldedProtocol;
+    use zcash_protocol::ShieldedPool;
 
     #[cfg(feature = "transparent-inputs")]
     use {
@@ -197,11 +204,11 @@ mod serialization {
         zcash_protocol::consensus::Network::MainNetwork as EncodingParams,
     };
 
-    impl From<SentNote> for proto::SentNote {
-        fn from(note: SentNote) -> Self {
+    impl From<&SentNote> for proto::SentNote {
+        fn from(note: &SentNote) -> Self {
             Self {
                 from_account_id: *note.from_account_id,
-                to: Some(note.to.into()),
+                to: Some((&note.to).into()),
                 value: note.value.into(),
                 memo: note.memo.encode().as_array().to_vec(),
             }
@@ -221,25 +228,21 @@ mod serialization {
         }
     }
 
-    impl From<SentNoteId> for proto::NoteId {
-        fn from(note_id: SentNoteId) -> Self {
+    impl From<&SentNoteId> for proto::NoteId {
+        fn from(note_id: &SentNoteId) -> Self {
             match note_id {
                 SentNoteId::Shielded(note_id) => proto::NoteId {
                     tx_id: Some(note_id.txid().into()),
                     output_index: note_id.output_index().into(),
                     pool: match note_id.protocol() {
-                        ShieldedProtocol::Sapling => proto::PoolType::ShieldedSapling as i32,
-                        ShieldedProtocol::Orchard => proto::PoolType::ShieldedOrchard as i32,
-                        // The in-memory backend does not track Ironwood (NU6.3) notes, so no
-                        // Ironwood sent-note id is ever produced.
-                        ShieldedProtocol::Ironwood => unreachable!(
-                            "the in-memory backend does not track Ironwood notes"
-                        ),
+                        ShieldedPool::Sapling => proto::PoolType::ShieldedSapling as i32,
+                        ShieldedPool::Orchard => proto::PoolType::ShieldedOrchard as i32,
+                        ShieldedPool::Ironwood => proto::PoolType::ShieldedIronwood as i32,
                     },
                 },
                 SentNoteId::Transparent { txid, output_index } => proto::NoteId {
                     tx_id: Some(txid.into()),
-                    output_index,
+                    output_index: *output_index,
                     pool: proto::PoolType::Transparent as i32,
                 },
             }
@@ -250,30 +253,22 @@ mod serialization {
         type Error = Error;
 
         fn try_from(note_id: proto::NoteId) -> Result<Self, Self::Error> {
-            Ok(match note_id.pool() {
-                proto::PoolType::ShieldedSapling => SentNoteId::Shielded(NoteId::new(
-                    read_optional!(note_id, tx_id)?.try_into()?,
-                    Sapling,
-                    note_id.output_index.try_into()?,
-                )),
-                #[cfg(feature = "orchard")]
-                proto::PoolType::ShieldedOrchard => SentNoteId::Shielded(NoteId::new(
-                    read_optional!(note_id, tx_id)?.try_into()?,
-                    Orchard,
-                    note_id.output_index.try_into()?,
-                )),
-                #[cfg(not(feature = "orchard"))]
-                proto::PoolType::ShieldedOrchard => return Err(Error::OrchardNotEnabled),
+            Ok(match proto_enum::<proto::PoolType>("pool", note_id.pool)? {
                 proto::PoolType::Transparent => SentNoteId::Transparent {
                     txid: read_optional!(note_id, tx_id)?.try_into()?,
                     output_index: note_id.output_index,
                 },
+                pool => SentNoteId::Shielded(NoteId::new(
+                    read_optional!(note_id, tx_id)?.try_into()?,
+                    crate::types::notes::shielded_protocol_from_proto(pool)?,
+                    note_id.output_index.try_into()?,
+                )),
             })
         }
     }
 
-    impl From<OutPoint> for proto::OutPoint {
-        fn from(outpoint: OutPoint) -> Self {
+    impl From<&OutPoint> for proto::OutPoint {
+        fn from(outpoint: &OutPoint) -> Self {
             Self {
                 hash: outpoint.txid().as_ref().to_vec(),
                 n: outpoint.n(),
@@ -289,8 +284,8 @@ mod serialization {
         }
     }
 
-    impl From<Recipient<AccountId>> for proto::Recipient {
-        fn from(recipient: Recipient<AccountId>) -> Self {
+    impl From<&Recipient<AccountId>> for proto::Recipient {
+        fn from(recipient: &Recipient<AccountId>) -> Self {
             match recipient {
                 Recipient::External {
                     recipient_address,
@@ -299,18 +294,15 @@ mod serialization {
                     recipient_type: proto::RecipientType::ExternalRecipient as i32,
 
                     address: Some(recipient_address.to_string()),
-                    pool_type: Some(match output_pool {
+                    pool_type: Some(match *output_pool {
                         PoolType::Transparent => proto::PoolType::Transparent,
                         PoolType::Shielded(Sapling) => proto::PoolType::ShieldedSapling,
-                        #[cfg(feature = "orchard")]
-                        PoolType::Shielded(Orchard) => proto::PoolType::ShieldedOrchard,
-                        // The in-memory backend does not send to the Ironwood (NU6.3) pool, so no
-                        // external Ironwood recipient is ever serialized.
-                        PoolType::Shielded(zcash_protocol::ShieldedPool::Ironwood) => {
-                            unreachable!("the in-memory backend does not produce Ironwood outputs")
+                        PoolType::Shielded(ShieldedPool::Orchard) => {
+                            proto::PoolType::ShieldedOrchard
                         }
-                        #[cfg(not(feature = "orchard"))]
-                        _ => panic!("Orchard not enabled"),
+                        PoolType::Shielded(ShieldedPool::Ironwood) => {
+                            proto::PoolType::ShieldedIronwood
+                        }
                     } as i32),
 
                     account_id: None,
@@ -328,7 +320,7 @@ mod serialization {
                     address: Some(ephemeral_address.encode(&EncodingParams)),
                     pool_type: Some(proto::PoolType::Transparent as i32),
 
-                    account_id: Some(*receiving_account),
+                    account_id: Some(**receiving_account),
                     outpoint: Some(outpoint.into()),
                     note: None,
                 },
@@ -342,7 +334,7 @@ mod serialization {
                     address: Some(recipient_address.encode(&EncodingParams)),
                     pool_type: Some(proto::PoolType::Transparent as i32),
 
-                    account_id: Some(*receiving_account),
+                    account_id: Some(**receiving_account),
                     outpoint: None,
                     note: None,
                 },
@@ -353,12 +345,12 @@ mod serialization {
                 } => proto::Recipient {
                     recipient_type: proto::RecipientType::InternalAccount as i32,
 
-                    address: external_address.map(|a| a.to_string()),
+                    address: external_address.as_ref().map(|a| a.to_string()),
                     pool_type: None,
 
-                    account_id: Some(*receiving_account),
+                    account_id: Some(**receiving_account),
                     outpoint: None,
-                    note: Some(note.deref().clone().into()),
+                    note: Some(note.deref().into()),
                 },
             }
         }
@@ -367,21 +359,23 @@ mod serialization {
     impl TryFrom<proto::Recipient> for Recipient<AccountId> {
         type Error = Error;
         fn try_from(recipient: proto::Recipient) -> Result<Self, Self::Error> {
-            Ok(match recipient.recipient_type() {
+            let recipient_type =
+                proto_enum::<proto::RecipientType>("recipient_type", recipient.recipient_type)?;
+            Ok(match recipient_type {
                 proto::RecipientType::ExternalRecipient => {
                     let address_str = read_optional!(recipient.clone(), address)?;
                     let address = ZcashAddress::try_from_encoded(&address_str)?;
+                    let pool_type = proto_enum::<proto::PoolType>(
+                        "pool_type",
+                        read_optional!(recipient, pool_type)?,
+                    )?;
                     Recipient::External {
                         recipient_address: address,
-                        output_pool: match recipient.pool_type() {
+                        output_pool: match pool_type {
                             proto::PoolType::Transparent => PoolType::Transparent,
-                            proto::PoolType::ShieldedSapling => PoolType::Shielded(Sapling),
-                            #[cfg(feature = "orchard")]
-                            proto::PoolType::ShieldedOrchard => PoolType::Shielded(Orchard),
-                            #[cfg(not(feature = "orchard"))]
-                            proto::PoolType::ShieldedOrchard => {
-                                return Err(Error::OrchardNotEnabled);
-                            }
+                            pool => PoolType::Shielded(
+                                crate::types::notes::shielded_protocol_from_proto(pool)?,
+                            ),
                         },
                     }
                 }
@@ -401,7 +395,7 @@ mod serialization {
                 proto::RecipientType::InternalAccount => Recipient::InternalShielded {
                     receiving_account: read_optional!(recipient, account_id)?.into(),
                     external_address: recipient.address.map(|a| a.parse()).transpose()?,
-                    note: Box::new(read_optional!(recipient, note)?.into()),
+                    note: Box::new(read_optional!(recipient, note)?.try_into()?),
                 },
                 proto::RecipientType::InternalTransparent => {
                     #[cfg(not(feature = "transparent-inputs"))]
@@ -424,17 +418,17 @@ mod serialization {
         use super::*;
         use crate::proto::memwallet as proto;
 
-        use zcash_protocol::ShieldedProtocol;
+        use zcash_protocol::ShieldedPool;
 
         #[test]
         fn proto_roundtrip_recipient() {
             let recipient = Recipient::<AccountId>::External{
                 recipient_address: ZcashAddress::try_from_encoded("uregtest1a7mkafdn9c87xywjnyup65uker8tx3y72r9f6elcfm6uh263c9s6smcw6xm5m8k8eythcreuyqktp9z7mtpcd6jsm5xw7skgdcfjx84z").unwrap(),
-                output_pool: PoolType::Shielded(ShieldedProtocol::Sapling),
+                output_pool: PoolType::Shielded(ShieldedPool::Sapling),
         };
-            let proto = proto::Recipient::from(recipient.clone());
+            let proto = proto::Recipient::from(&recipient);
             let recipient2 = Recipient::<AccountId>::try_from(proto.clone()).unwrap();
-            let proto2 = proto::Recipient::from(recipient2.clone());
+            let proto2 = proto::Recipient::from(&recipient2);
             assert_eq!(proto, proto2);
         }
     }
