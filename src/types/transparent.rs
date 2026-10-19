@@ -13,6 +13,7 @@ use zcash_client_backend::wallet::WalletTransparentOutput;
 use zcash_protocol::{TxId, consensus::BlockHeight};
 
 use super::AccountId;
+#[cfg(feature = "transparent-inputs")]
 use crate::Error;
 
 /// Stores the transparent outputs received by the wallet.
@@ -167,21 +168,21 @@ impl Deref for TransparentSpendCache {
 
 mod serialization {
     use super::*;
+    use crate::{Error, proto::memwallet as proto, read_optional};
     use bip32::ChildNumber;
-    use crate::{proto::memwallet as proto, read_optional, Error};
     use transparent::address::Script;
     use zcash_keys::encoding::AddressCodec;
     use zcash_protocol::{consensus::Network::MainNetwork as EncodingParams, value::Zatoshis};
 
-    impl From<ReceivedTransparentOutput> for proto::ReceivedTransparentOutput {
-        fn from(output: ReceivedTransparentOutput) -> Self {
+    impl From<&ReceivedTransparentOutput> for proto::ReceivedTransparentOutput {
+        fn from(output: &ReceivedTransparentOutput) -> Self {
             // Convert TransparentKeyScope to u32 via ChildNumber (the only public API)
             let key_scope_child: ChildNumber = output.key_scope.into();
             Self {
                 transaction_id: output.transaction_id.as_ref().to_vec(),
                 account_id: *output.account_id,
                 address: output.address.encode(&EncodingParams),
-                txout: Some(output.txout.into()),
+                txout: Some((&output.txout).into()),
                 max_observed_unspent_height: output.max_observed_unspent_height.map(|h| h.into()),
                 key_scope: Some(key_scope_child.index()),
             }
@@ -194,11 +195,12 @@ mod serialization {
         fn try_from(output: proto::ReceivedTransparentOutput) -> Result<Self, Self::Error> {
             // Handle key_scope with backwards compatibility
             let key_scope = match output.key_scope {
-                Some(scope_value) => TransparentKeyScope::custom(scope_value)
-                    .ok_or_else(|| Error::CorruptedData(
-                        format!("Invalid TransparentKeyScope value: {} (must be < 2^31)", scope_value)
-                    ))?,
-                None => TransparentKeyScope::EXTERNAL,  // Default for old data without key_scope
+                Some(scope_value) => TransparentKeyScope::custom(scope_value).ok_or_else(|| {
+                    Error::CorruptedData(format!(
+                        "Invalid TransparentKeyScope value: {scope_value} (must be < 2^31)"
+                    ))
+                })?,
+                None => TransparentKeyScope::EXTERNAL, // Default for old data without key_scope
             };
 
             Ok(Self {
@@ -212,8 +214,8 @@ mod serialization {
         }
     }
 
-    impl From<TxOut> for proto::TxOut {
-        fn from(txout: TxOut) -> Self {
+    impl From<&TxOut> for proto::TxOut {
+        fn from(txout: &TxOut) -> Self {
             Self {
                 script: txout.script_pubkey().0.0.clone(),
                 value: u64::from(txout.value()),

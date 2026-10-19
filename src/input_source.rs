@@ -9,7 +9,7 @@ use zcash_client_backend::{
 };
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::{
-    ShieldedPool::{self as ShieldedProtocol, Sapling},
+    ShieldedPool::{self, Sapling},
     consensus::{self, BranchId},
     value::Zatoshis,
 };
@@ -37,7 +37,7 @@ impl<P: consensus::Parameters> InputSource for MemoryWalletDb<P> {
     fn get_spendable_note(
         &self,
         txid: &zcash_primitives::transaction::TxId,
-        protocol: zcash_protocol::ShieldedProtocol,
+        protocol: ShieldedPool,
         index: u32,
         target_height: TargetHeight,
     ) -> Result<
@@ -49,9 +49,10 @@ impl<P: consensus::Parameters> InputSource for MemoryWalletDb<P> {
         >,
         Self::Error,
     > {
-        let note = self.received_notes.iter().find(|rn| {
-            &rn.txid == txid && rn.note.pool() == protocol && rn.output_index == index
-        });
+        let note = self
+            .received_notes
+            .iter()
+            .find(|rn| &rn.txid == txid && rn.note.pool() == protocol && rn.output_index == index);
 
         Ok(if let Some(note) = note {
             if self.note_is_spent(note, target_height)? {
@@ -100,7 +101,7 @@ impl<P: consensus::Parameters> InputSource for MemoryWalletDb<P> {
         &self,
         account: Self::AccountId,
         target_value: TargetValue,
-        sources: &[zcash_protocol::ShieldedProtocol],
+        sources: &[ShieldedPool],
         target_height: TargetHeight,
         confirmations_policy: ConfirmationsPolicy,
         exclude: &[Self::NoteRef],
@@ -132,17 +133,33 @@ impl<P: consensus::Parameters> InputSource for MemoryWalletDb<P> {
             Vec::new()
         };
 
+        #[cfg(feature = "orchard")]
+        let ironwood_eligible_notes = if sources.contains(&ShieldedPool::Ironwood) {
+            self.select_spendable_notes_from_pool(
+                account,
+                target_value,
+                &ShieldedPool::Ironwood,
+                target_height,
+                confirmations_policy,
+                exclude,
+            )?
+        } else {
+            Vec::new()
+        };
+
         to_spendable_notes(
             &sapling_eligible_notes,
             #[cfg(feature = "orchard")]
             &orchard_eligible_notes,
+            #[cfg(feature = "orchard")]
+            &ironwood_eligible_notes,
         )
     }
 
     fn select_unspent_notes(
         &self,
         _account: Self::AccountId,
-        _sources: &[ShieldedProtocol],
+        _sources: &[ShieldedPool],
         _target_height: TargetHeight,
         _exclude: &[Self::NoteRef],
     ) -> Result<ReceivedNotes<Self::NoteRef>, Self::Error> {
@@ -180,7 +197,7 @@ impl<P: consensus::Parameters> InputSource for MemoryWalletDb<P> {
                 // non-coinbase and included, matching the SQL implementation's IFNULL(tx_index, 1)
                 // != 0 behavior.
                 CoinbaseFilter::NonCoinbaseOnly => {
-                    tx.map_or(true, |tx| tx.tx_index().unwrap_or(1) != 0)
+                    tx.is_none_or(|tx| tx.tx_index().unwrap_or(1) != 0)
                 }
             })
             .filter_map(|(outpoint, txo, tx)| {
@@ -228,7 +245,7 @@ impl<P: consensus::Parameters> InputSource for MemoryWalletDb<P> {
         );
 
         let sapling_pool_meta = self.spendable_notes_meta(
-            ShieldedProtocol::Sapling,
+            ShieldedPool::Sapling,
             account_id,
             selector,
             target_height,
@@ -238,7 +255,7 @@ impl<P: consensus::Parameters> InputSource for MemoryWalletDb<P> {
 
         #[cfg(feature = "orchard")]
         let orchard_pool_meta = self.spendable_notes_meta(
-            ShieldedProtocol::Orchard,
+            ShieldedPool::Orchard,
             account_id,
             selector,
             target_height,
@@ -252,7 +269,7 @@ impl<P: consensus::Parameters> InputSource for MemoryWalletDb<P> {
         // metadata query against the Ironwood value pool.
         #[cfg(feature = "orchard")]
         let ironwood_pool_meta = self.spendable_notes_meta(
-            ShieldedProtocol::Ironwood,
+            ShieldedPool::Ironwood,
             account_id,
             selector,
             target_height,
@@ -277,7 +294,7 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
         &self,
         account: AccountId,
         target_value: TargetValue,
-        pool: &zcash_protocol::ShieldedProtocol,
+        pool: &ShieldedPool,
         target_height: TargetHeight,
         confirmations_policy: ConfirmationsPolicy,
         exclude: &[NoteId],
@@ -369,11 +386,13 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
                     TransactionStatus::Mined(_height) => true,
                     TransactionStatus::TxidNotRecognized => unreachable!(),
                     TransactionStatus::NotInMainChain => {
-                        // transaction either never expires, or expires in the future.
-                        spending_tx
-                            .expiry_height()
-                            .iter()
-                            .all(|h| *h >= BlockHeight::from(target_height))
+                        // The spend counts while the transaction cannot have lapsed: it never
+                        // expires (expiry height 0) or expires at or after the target height.
+                        // An unknown expiry (`None`, an entry created by a scan that was then
+                        // rolled back) may have lapsed, so the note is treated as unspent.
+                        spending_tx.expiry_height().is_some_and(|h| {
+                            h == BlockHeight::from(0) || h >= BlockHeight::from(target_height)
+                        })
                     }
                 }
             }
@@ -384,7 +403,7 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
 
     fn spendable_notes_meta(
         &self,
-        protocol: ShieldedProtocol,
+        protocol: ShieldedPool,
         account: AccountId,
         filter: &NoteFilter,
         target_height: TargetHeight,
