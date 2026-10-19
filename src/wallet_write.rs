@@ -29,22 +29,22 @@ use zcash_client_backend::{
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::{
     PoolType,
-    ShieldedPool::{self as ShieldedProtocol, Sapling},
+    ShieldedPool::{self, Sapling},
     TxId,
     consensus::{self, BlockHeight, NetworkUpgrade},
 };
 use zip32::{DiversifierIndex, fingerprint::SeedFingerprint};
 
 use crate::{
-    MemoryWalletBlock, MemoryWalletDb, Nullifier, PRUNING_DEPTH, ReceivedNote, VERIFY_LOOKAHEAD,
-    error::Error,
+    AccountId, MemoryWalletBlock, MemoryWalletDb, Nullifier, PRUNING_DEPTH, ReceivedNote,
+    VERIFY_LOOKAHEAD, error::Error,
 };
 
 #[cfg(feature = "orchard")]
 use {
-    shardtree::error::ShardTreeError, std::collections::BTreeMap,
-    zcash_client_backend::data_api::ORCHARD_SHARD_HEIGHT,
-    zcash_protocol::ShieldedPool::Orchard,
+    crate::types::notes::shielded_protocol_for_value_pool, shardtree::error::ShardTreeError,
+    std::collections::BTreeMap, zcash_client_backend::data_api::ORCHARD_SHARD_HEIGHT,
+    zcash_client_backend::wallet::WalletOrchardOutput,
 };
 
 #[cfg(feature = "transparent-inputs")]
@@ -296,6 +296,199 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
         from_state: &ChainState,
         blocks: Vec<ScannedBlock<Self::AccountId>>,
     ) -> Result<(), Self::Error> {
+        self.mutate("put_blocks", |db| db.put_blocks_inner(from_state, blocks))
+    }
+
+    /// Adds a transparent UTXO received by the wallet to the data store.
+    fn put_received_transparent_utxo(
+        &mut self,
+        output: &WalletTransparentOutput<Self::AccountId>,
+    ) -> Result<Self::UtxoRef, Self::Error> {
+        self.mutate("put_received_transparent_utxo", |db| {
+            db.put_received_transparent_utxo_inner(output)
+        })
+    }
+
+    fn store_decrypted_tx(
+        &mut self,
+        d_tx: DecryptedTransaction<Transaction, Self::AccountId>,
+    ) -> Result<(), Self::Error> {
+        self.mutate("store_decrypted_tx", |db| db.store_decrypted_tx_inner(d_tx))
+    }
+
+    fn set_tx_trust(&mut self, _txid: TxId, _trusted: bool) -> Result<(), Self::Error> {
+        todo!()
+    }
+
+    /// Truncates the database to the given height.
+    ///
+    /// If the requested height is greater than or equal to the height of the last scanned
+    /// block, this function does nothing.
+    ///
+    /// This should only be executed inside a transactional context.
+    fn truncate_to_height(&mut self, max_height: BlockHeight) -> Result<BlockHeight, Self::Error> {
+        self.mutate("truncate_to_height", |db| {
+            db.truncate_to_height_inner(max_height)
+        })
+    }
+
+    fn truncate_to_chain_state(&mut self, _chain_state: ChainState) -> Result<(), Self::Error> {
+        todo!()
+    }
+
+    fn rewind_to_chain_state(
+        &mut self,
+        _chain_state: ChainState,
+        _reset_account_birthdays: HashSet<Self::AccountId>,
+    ) -> Result<(), RewindError<Self::AccountId, Self::Error>> {
+        todo!()
+    }
+
+    fn import_account_hd(
+        &mut self,
+        _account_name: &str,
+        _seed: &SecretVec<u8>,
+        _account_index: zip32::AccountId,
+        _birthday: &AccountBirthday,
+        _key_source: Option<&str>,
+    ) -> Result<(Self::Account, UnifiedSpendingKey), Self::Error> {
+        unimplemented!(
+            "Memwallet does not support adding accounts from seed phrases. 
+Instead derive the ufvk in the calling code and import it using `import_account_ufvk`"
+        )
+    }
+
+    fn import_account_ufvk(
+        &mut self,
+        account_name: &str,
+        unified_key: &UnifiedFullViewingKey,
+        birthday: &AccountBirthday,
+        purpose: AccountPurpose,
+        key_source: Option<&str>,
+    ) -> Result<Self::Account, Self::Error> {
+        tracing::debug!("import_account_ufvk");
+        let (_id, account) = self.add_account(
+            account_name,
+            AccountSource::Imported {
+                purpose,
+                key_source: key_source.map(str::to_owned),
+            },
+            unified_key.to_owned(),
+            birthday.clone(),
+        )?;
+        Ok(account)
+    }
+
+    fn store_transactions_to_be_sent(
+        &mut self,
+        transactions: &[SentTransaction<Self::AccountId>],
+    ) -> Result<(), Self::Error> {
+        self.mutate("store_transactions_to_be_sent", |db| {
+            db.store_transactions_to_be_sent_inner(transactions)
+        })
+    }
+
+    fn set_transaction_status(
+        &mut self,
+        txid: TxId,
+        status: TransactionStatus,
+    ) -> Result<(), Self::Error> {
+        tracing::debug!("set_transaction_status");
+        self.mutate("set_transaction_status", |db| {
+            db.tx_table.set_transaction_status(&txid, status)
+        })
+    }
+
+    #[cfg(feature = "transparent-inputs")]
+    fn reserve_next_n_ephemeral_addresses(
+        &mut self,
+        account_id: Self::AccountId,
+        n: usize,
+    ) -> Result<Vec<(TransparentAddress, TransparentAddressMetadata)>, Self::Error> {
+        use zcash_keys::keys::AddressGenerationError;
+        // TODO: We need to implement first_unsafe_index to make sure we dont violate gap invarient
+
+        use transparent::keys::NonHardenedChildIndex;
+        let first_unsafe = self.first_unsafe_index(account_id)?;
+        if let Some(account) = self.accounts.get_mut(account_id) {
+            let first_unreserved = account.first_unreserved_index()?;
+
+            let allocation = range_from(first_unreserved, u32::try_from(n).unwrap());
+
+            if allocation.len() < n {
+                return Err(AddressGenerationError::DiversifierSpaceExhausted.into());
+            }
+            if allocation.end > first_unsafe {
+                return Err(Error::ReachedGapLimit(
+                    account_id,
+                    core::cmp::max(first_unreserved, first_unsafe),
+                ));
+            }
+            let _reserved = account.reserve_until(allocation.end)?;
+            self.get_known_ephemeral_addresses(
+                account_id,
+                Some(
+                    NonHardenedChildIndex::from_index(allocation.start).expect("Bad Index")
+                        ..NonHardenedChildIndex::from_index(allocation.end).expect("Bad Index"),
+                ),
+            )
+        } else {
+            Err(Self::Error::AccountUnknown(account_id))
+        }
+    }
+
+    fn get_address_for_index(
+        &mut self,
+        _account: Self::AccountId,
+        _diversifier_index: DiversifierIndex,
+        _request: UnifiedAddressRequest,
+    ) -> Result<Option<UnifiedAddress>, Self::Error> {
+        todo!()
+    }
+
+    #[cfg(feature = "transparent-inputs")]
+    fn notify_address_checked(
+        &mut self,
+        _request: TransactionsInvolvingAddress,
+        _as_of_height: BlockHeight,
+    ) -> Result<(), Self::Error> {
+        // No-op for now - this notifies that an address range was checked for transactions.
+        // In the sqlite implementation, this updates address metadata tracking.
+        // For the memory wallet, we don't need to track this state.
+        Ok(())
+    }
+
+    #[cfg(feature = "transparent-key-import")]
+    fn import_standalone_transparent_pubkey(
+        &mut self,
+        _account: Self::AccountId,
+        _pubkey: secp256k1::PublicKey,
+    ) -> Result<(), Self::Error> {
+        todo!()
+    }
+
+    #[cfg(feature = "transparent-key-import")]
+    fn import_standalone_transparent_script(
+        &mut self,
+        _account: Self::AccountId,
+        _script: zcash_script::script::Redeem,
+    ) -> Result<(), Self::Error> {
+        todo!()
+    }
+}
+
+/// The bodies of the [`WalletWrite`] operations that change persisted state. Each is run through
+/// `MemoryWalletDb::mutate` by its trait method, so a failure part-way leaves the wallet marked
+/// dirty and it refuses to be encoded until it is rebuilt from the last good blob.
+impl<P: consensus::Parameters> MemoryWalletDb<P> {
+    /// Adds a sequence of blocks to the data store.
+    ///
+    /// Assumes blocks will be here in order.
+    fn put_blocks_inner(
+        &mut self,
+        from_state: &ChainState,
+        blocks: Vec<ScannedBlock<AccountId>>,
+    ) -> Result<(), Error> {
         tracing::debug!("put_blocks");
         let mut last_scanned_height = None;
         struct BlockPositions {
@@ -303,6 +496,8 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
             sapling_start_position: Position,
             #[cfg(feature = "orchard")]
             orchard_start_position: Position,
+            #[cfg(feature = "orchard")]
+            ironwood_start_position: Position,
         }
         let start_positions = blocks.first().map(|block| BlockPositions {
             height: block.height(),
@@ -315,11 +510,18 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
                 u64::from(block.orchard().final_tree_size())
                     - u64::try_from(block.orchard().commitments().len()).unwrap(),
             ),
+            #[cfg(feature = "orchard")]
+            ironwood_start_position: Position::from(
+                u64::from(block.ironwood().final_tree_size())
+                    - u64::try_from(block.ironwood().commitments().len()).unwrap(),
+            ),
         });
 
         let mut sapling_commitments = vec![];
         #[cfg(feature = "orchard")]
         let mut orchard_commitments = vec![];
+        #[cfg(feature = "orchard")]
+        let mut ironwood_commitments = vec![];
         let mut note_positions = vec![];
         for block in blocks.into_iter() {
             let mut transactions = HashMap::new();
@@ -350,6 +552,12 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
                     self.mark_orchard_note_spent(*spend.nf(), txid)?;
                 }
 
+                // Likewise for the Ironwood pool, which reveals Orchard-shaped nullifiers of its own.
+                #[cfg(feature = "orchard")]
+                for spend in transaction.ironwood_spends() {
+                    self.mark_ironwood_note_spent(*spend.nf(), txid)?;
+                }
+
                 for output in transaction.sapling_outputs() {
                     // Insert the memo into the `memos` map.
                     let note_id = NoteId::new(
@@ -372,27 +580,43 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
                     self.insert_received_sapling_note(note_id, output, spent_in);
                 }
 
+                // Orchard and Ironwood outputs are stored the same way; the output's value pool
+                // decides the note identifier's protocol and the nullifier's pool tag.
                 #[cfg(feature = "orchard")]
-                for output in transaction.orchard_outputs().iter() {
-                    // Insert the memo into the `memos` map.
+                let mut put_orchard_family_output = |this: &mut Self,
+                                                     output: &WalletOrchardOutput<AccountId>|
+                 -> Result<(), Error> {
+                    let pool = output.note().1;
                     let note_id = NoteId::new(
                         txid,
-                        Orchard,
+                        shielded_protocol_for_value_pool(pool),
                         u16::try_from(output.index())
                             .expect("output indices are representable as u16"),
                     );
-                    if let Ok(Some(memo)) = self.get_memo(note_id) {
+                    // Insert the memo into the `memos` map.
+                    if let Ok(Some(memo)) = this.get_memo(note_id) {
                         memos.insert(note_id, memo.encode());
                     }
                     // Check whether this note was spent in a later block range that
                     // we previously scanned.
                     let spent_in = output
                         .nf()
-                        .and_then(|nf| self.nullifiers.get(&Nullifier::Orchard(*nf)))
-                        .and_then(|(height, tx_idx)| self.tx_locator.get(*height, *tx_idx))
+                        .and_then(|nf| this.nullifiers.get(&Nullifier::orchard_family(pool, *nf)))
+                        .and_then(|(height, tx_idx)| this.tx_locator.get(*height, *tx_idx))
                         .copied();
 
-                    self.insert_received_orchard_note(note_id, output, spent_in)
+                    this.insert_received_orchard_note(note_id, output, spent_in);
+                    Ok(())
+                };
+
+                #[cfg(feature = "orchard")]
+                for output in transaction.orchard_outputs().iter() {
+                    put_orchard_family_output(self, output)?;
+                }
+
+                #[cfg(feature = "orchard")]
+                for output in transaction.ironwood_outputs().iter() {
+                    put_orchard_family_output(self, output)?;
                 }
 
                 transactions.insert(txid, transaction.clone());
@@ -402,20 +626,25 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
             self.insert_sapling_nullifier_map(block.height(), block.sapling().nullifier_map())?;
             #[cfg(feature = "orchard")]
             self.insert_orchard_nullifier_map(block.height(), block.orchard().nullifier_map())?;
+            #[cfg(feature = "orchard")]
+            self.insert_ironwood_nullifier_map(block.height(), block.ironwood().nullifier_map())?;
             note_positions.extend(block.transactions().iter().flat_map(|wtx| {
-                let iter = wtx.sapling_outputs().iter().map(|out| {
-                    (
-                        ShieldedProtocol::Sapling,
-                        out.note_commitment_tree_position(),
-                    )
-                });
+                let iter = wtx
+                    .sapling_outputs()
+                    .iter()
+                    .map(|out| (ShieldedPool::Sapling, out.note_commitment_tree_position()));
                 #[cfg(feature = "orchard")]
-                let iter = iter.chain(wtx.orchard_outputs().iter().map(|out| {
-                    (
-                        ShieldedProtocol::Orchard,
-                        out.note_commitment_tree_position(),
-                    )
-                }));
+                let iter = iter.chain(
+                    wtx.orchard_outputs()
+                        .iter()
+                        .map(|out| (ShieldedPool::Orchard, out.note_commitment_tree_position())),
+                );
+                #[cfg(feature = "orchard")]
+                let iter = iter.chain(
+                    wtx.ironwood_outputs()
+                        .iter()
+                        .map(|out| (ShieldedPool::Ironwood, out.note_commitment_tree_position())),
+                );
 
                 iter
             }));
@@ -432,6 +661,12 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
                 orchard_commitment_tree_size: Some(block.orchard().final_tree_size()),
                 #[cfg(feature = "orchard")]
                 orchard_action_count: Some(block.orchard().commitments().len().try_into().unwrap()),
+                #[cfg(feature = "orchard")]
+                ironwood_commitment_tree_size: Some(block.ironwood().final_tree_size()),
+                #[cfg(feature = "orchard")]
+                ironwood_action_count: Some(
+                    block.ironwood().commitments().len().try_into().unwrap(),
+                ),
             };
 
             // Insert transaction metadata into the transaction table
@@ -447,7 +682,12 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
             sapling_commitments.extend(block_commitments.sapling.into_iter().map(Some));
             #[cfg(feature = "orchard")]
             orchard_commitments.extend(block_commitments.orchard.into_iter().map(Some));
+            #[cfg(feature = "orchard")]
+            ironwood_commitments.extend(block_commitments.ironwood.into_iter().map(Some));
         }
+
+        // Drop nullifier-map entries that can no longer be matched, as the upstream `put_blocks` does.
+        self.prune_tracked_nullifiers(PRUNING_DEPTH)?;
 
         if let Some((start_positions, last_scanned_height)) =
             start_positions.zip(last_scanned_height)
@@ -487,7 +727,27 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
                 .map(|res| (res.subtree, res.checkpoints))
                 .collect::<Vec<_>>();
 
-            // Collect the complete set of Sapling checkpoints
+            // The Ironwood tree is Orchard-shaped, so its subtrees are built the same way.
+            #[cfg(feature = "orchard")]
+            let ironwood_subtrees = ironwood_commitments
+                .par_chunks_mut(CHUNK_SIZE)
+                .enumerate()
+                .filter_map(|(i, chunk)| {
+                    let start = start_positions.ironwood_start_position + (i * CHUNK_SIZE) as u64;
+                    let end = start + chunk.len() as u64;
+
+                    shardtree::LocatedTree::from_iter(
+                        start..end,
+                        ORCHARD_SHARD_HEIGHT.into(),
+                        chunk.iter_mut().map(|n| n.take().expect("always Some")),
+                    )
+                })
+                .map(|res| (res.subtree, res.checkpoints))
+                .collect::<Vec<_>>();
+
+            // Collect the complete set of checkpoints in each tree, so that every tree can be
+            // given a checkpoint at each height any other tree is checkpointed at. Anchors are
+            // selected per height across all trees, so the sets must line up.
             #[cfg(feature = "orchard")]
             let sapling_checkpoint_positions: BTreeMap<BlockHeight, Position> = sapling_subtrees
                 .iter()
@@ -503,23 +763,47 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
                 .collect();
 
             #[cfg(feature = "orchard")]
-            let (missing_sapling_checkpoints, missing_orchard_checkpoints) = (
+            let ironwood_checkpoint_positions: BTreeMap<BlockHeight, Position> = ironwood_subtrees
+                .iter()
+                .flat_map(|(_, checkpoints)| checkpoints.iter())
+                .map(|(k, v)| (*k, *v))
+                .collect();
+
+            #[cfg(feature = "orchard")]
+            let all_checkpoint_heights: BTreeSet<BlockHeight> = sapling_checkpoint_positions
+                .keys()
+                .chain(orchard_checkpoint_positions.keys())
+                .chain(ironwood_checkpoint_positions.keys())
+                .copied()
+                .collect();
+
+            #[cfg(feature = "orchard")]
+            let (
+                missing_sapling_checkpoints,
+                missing_orchard_checkpoints,
+                missing_ironwood_checkpoints,
+            ) = (
                 ensure_checkpoints(
-                    orchard_checkpoint_positions.keys(),
+                    all_checkpoint_heights.iter(),
                     &sapling_checkpoint_positions,
                     from_state.final_sapling_tree(),
                 ),
                 ensure_checkpoints(
-                    sapling_checkpoint_positions.keys(),
+                    all_checkpoint_heights.iter(),
                     &orchard_checkpoint_positions,
                     from_state.final_orchard_tree(),
+                ),
+                ensure_checkpoints(
+                    all_checkpoint_heights.iter(),
+                    &ironwood_checkpoint_positions,
+                    from_state.final_ironwood_tree(),
                 ),
             );
 
             // Update the Sapling note commitment tree with all newly read note commitments
             {
                 let mut sapling_subtrees_iter = sapling_subtrees.into_iter();
-                self.with_sapling_tree_mut::<_, _, Self::Error>(|sapling_tree| {
+                self.with_sapling_tree_mut::<_, _, Error>(|sapling_tree| {
                     sapling_tree.insert_frontier(
                         from_state.final_sapling_tree().clone(),
                         Retention::Checkpoint {
@@ -541,7 +825,11 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
                             .store()
                             .min_checkpoint_id()
                             .map_err(ShardTreeError::Storage)?
-                            .expect("At least one checkpoint was inserted (by insert_frontier)");
+                            .ok_or_else(|| {
+                                Error::CorruptedData(
+                                    "no checkpoint after inserting the frontier".into(),
+                                )
+                            })?;
 
                         for (height, checkpoint) in &missing_sapling_checkpoints {
                             if *height > min_checkpoint_height {
@@ -561,7 +849,7 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
             #[cfg(feature = "orchard")]
             {
                 let mut orchard_subtrees = orchard_subtrees.into_iter();
-                self.with_orchard_tree_mut::<_, _, Self::Error>(|orchard_tree| {
+                self.with_orchard_tree_mut::<_, _, Error>(|orchard_tree| {
                     orchard_tree.insert_frontier(
                         from_state.final_orchard_tree().clone(),
                         Retention::Checkpoint {
@@ -582,11 +870,58 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
                             .store()
                             .min_checkpoint_id()
                             .map_err(ShardTreeError::Storage)?
-                            .expect("At least one checkpoint was inserted (by insert_frontier)");
+                            .ok_or_else(|| {
+                                Error::CorruptedData(
+                                    "no checkpoint after inserting the frontier".into(),
+                                )
+                            })?;
 
                         for (height, checkpoint) in &missing_orchard_checkpoints {
                             if *height > min_checkpoint_height {
                                 orchard_tree
+                                    .store_mut()
+                                    .add_checkpoint(*height, checkpoint.clone())
+                                    .map_err(ShardTreeError::Storage)?;
+                            }
+                        }
+                    }
+                    Ok(())
+                })?;
+            }
+
+            // Update the Ironwood note commitment tree with all newly read note commitments
+            #[cfg(feature = "orchard")]
+            {
+                let mut ironwood_subtrees = ironwood_subtrees.into_iter();
+                self.with_ironwood_tree_mut::<_, _, Error>(|ironwood_tree| {
+                    ironwood_tree.insert_frontier(
+                        from_state.final_ironwood_tree().clone(),
+                        Retention::Checkpoint {
+                            id: from_state.block_height(),
+                            marking: Marking::Reference,
+                        },
+                    )?;
+
+                    for (tree, checkpoints) in &mut ironwood_subtrees {
+                        ironwood_tree.insert_tree(tree, checkpoints)?;
+                    }
+
+                    // Ensure we have an Ironwood checkpoint for each checkpointed block height in
+                    // the other trees, skipping heights below the minimum retained checkpoint.
+                    {
+                        let min_checkpoint_height = ironwood_tree
+                            .store()
+                            .min_checkpoint_id()
+                            .map_err(ShardTreeError::Storage)?
+                            .ok_or_else(|| {
+                                Error::CorruptedData(
+                                    "no checkpoint after inserting the frontier".into(),
+                                )
+                            })?;
+
+                        for (height, checkpoint) in &missing_ironwood_checkpoints {
+                            if *height > min_checkpoint_height {
+                                ironwood_tree
                                     .store_mut()
                                     .add_checkpoint(*height, checkpoint.clone())
                                     .map_err(ShardTreeError::Storage)?;
@@ -608,12 +943,11 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
 
         Ok(())
     }
-
     /// Adds a transparent UTXO received by the wallet to the data store.
-    fn put_received_transparent_utxo(
+    fn put_received_transparent_utxo_inner(
         &mut self,
-        _output: &WalletTransparentOutput<Self::AccountId>,
-    ) -> Result<Self::UtxoRef, Self::Error> {
+        _output: &WalletTransparentOutput<AccountId>,
+    ) -> Result<OutPoint, Error> {
         tracing::debug!("put_received_transparent_utxo");
         #[cfg(feature = "transparent-inputs")]
         {
@@ -629,15 +963,15 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
             "The wallet must be compiled with the transparent-inputs feature to use this method."
         );
     }
-
-    fn store_decrypted_tx(
+    fn store_decrypted_tx_inner(
         &mut self,
-        d_tx: DecryptedTransaction<Transaction, Self::AccountId>,
-    ) -> Result<(), Self::Error> {
+        d_tx: DecryptedTransaction<Transaction, AccountId>,
+    ) -> Result<(), Error> {
         tracing::debug!("store_decrypted_tx");
         self.tx_table.put_tx_data(d_tx.tx(), None, None);
         if let Some(height) = d_tx.mined_height() {
-            self.set_transaction_status(d_tx.tx().txid(), TransactionStatus::Mined(height))?
+            self.tx_table
+                .set_transaction_status(&d_tx.tx().txid(), TransactionStatus::Mined(height))?
         }
 
         let funding_accounts = self.get_funding_accounts(d_tx.tx())?;
@@ -724,10 +1058,8 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
                 }
                 TransferType::Incoming => {
                     // Store incoming Sapling note
-                    let received_note = ReceivedNote::from_decrypted_sapling_output(
-                        d_tx.tx().txid(),
-                        output,
-                    )?;
+                    let received_note =
+                        ReceivedNote::from_decrypted_sapling_output(d_tx.tx().txid(), output)?;
                     self.received_notes.insert_received_note(received_note);
                 }
                 TransferType::WalletInternal => unreachable!(
@@ -736,8 +1068,14 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
             }
         }
 
+        // Orchard and Ironwood outputs are decrypted with the same keys and recorded the same
+        // way; each output carries the value pool it was found in.
         #[cfg(feature = "orchard")]
-        for output in d_tx.orchard_outputs() {
+        for output in d_tx
+            .orchard_outputs()
+            .iter()
+            .chain(d_tx.ironwood_outputs().iter())
+        {
             #[cfg(feature = "transparent-inputs")]
             {
                 tx_has_wallet_outputs = true;
@@ -761,7 +1099,9 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
 
                         Recipient::External {
                             recipient_address: wallet_address,
-                            output_pool: PoolType::ORCHARD,
+                            output_pool: PoolType::Shielded(shielded_protocol_for_value_pool(
+                                output.note().1,
+                            )),
                         }
                     };
 
@@ -807,10 +1147,8 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
                 }
                 TransferType::Incoming => {
                     // Store incoming Orchard note
-                    let received_note = ReceivedNote::from_decrypted_orchard_output(
-                        d_tx.tx().txid(),
-                        output,
-                    )?;
+                    let received_note =
+                        ReceivedNote::from_decrypted_orchard_output(d_tx.tx().txid(), output)?;
                     self.received_notes.insert_received_note(received_note);
                 }
                 TransferType::WalletInternal => unreachable!(
@@ -967,8 +1305,9 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
         {
             let detectable_via_scanning = d_tx.tx().sapling_bundle().is_some();
             #[cfg(feature = "orchard")]
-            let detectable_via_scanning =
-                detectable_via_scanning | d_tx.tx().orchard_bundle().is_some();
+            let detectable_via_scanning = detectable_via_scanning
+                | d_tx.tx().orchard_bundle().is_some()
+                | d_tx.tx().ironwood_bundle().is_some();
 
             if d_tx.mined_height().is_none() && !detectable_via_scanning {
                 self.transaction_data_request_queue
@@ -977,20 +1316,15 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
         }
         Ok(())
     }
-
-    fn set_tx_trust(&mut self, _txid: TxId, _trusted: bool) -> Result<(), Self::Error> {
-        todo!()
-    }
-
     /// Truncates the database to the given height.
     ///
     /// If the requested height is greater than or equal to the height of the last scanned
     /// block, this function does nothing.
     ///
     /// This should only be executed inside a transactional context.
-    fn truncate_to_height(&mut self, max_height: BlockHeight) -> Result<BlockHeight, Self::Error> {
+    fn truncate_to_height_inner(&mut self, max_height: BlockHeight) -> Result<BlockHeight, Error> {
         let truncation_height = {
-            // This is the intersection of all the checkpoint heights from the sapling and orchard tree.
+            // The intersection of the checkpoint heights of every tree that has checkpoints.
             let mut checkpoint_heights = BTreeSet::new();
             self.sapling_tree.store().for_each_checkpoint(
                 self.sapling_tree.store().checkpoint_count()?,
@@ -1001,19 +1335,23 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
             )?;
             #[cfg(feature = "orchard")]
             {
-                let mut orchard_checkpoint_heights = BTreeSet::new();
-                self.orchard_tree.store().for_each_checkpoint(
-                    self.orchard_tree.store().checkpoint_count()?,
-                    |height, _| {
-                        orchard_checkpoint_heights.insert(u32::from(*height));
+                // A tree without checkpoints has nothing to roll back and must not veto the
+                // rewind, as in `zcash_client_sqlite`: the Orchard tree is empty before NU5 and
+                // the Ironwood tree before NU6.3, or in a wallet restored from a snapshot taken
+                // before Ironwood support that has not scanned a block since.
+                for store in [self.orchard_tree.store(), self.ironwood_tree.store()] {
+                    let mut tree_checkpoint_heights = BTreeSet::new();
+                    store.for_each_checkpoint(store.checkpoint_count()?, |height, _| {
+                        tree_checkpoint_heights.insert(u32::from(*height));
                         Ok(())
-                    },
-                )?;
-
-                checkpoint_heights = checkpoint_heights
-                    .intersection(&orchard_checkpoint_heights)
-                    .copied()
-                    .collect();
+                    })?;
+                    if !tree_checkpoint_heights.is_empty() {
+                        checkpoint_heights = checkpoint_heights
+                            .intersection(&tree_checkpoint_heights)
+                            .copied()
+                            .collect();
+                    }
+                }
             }
             // All the checkpoints that are greater than the truncation height
             let over = checkpoint_heights.split_off(&(u32::from(max_height + 1)));
@@ -1081,6 +1419,10 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
             self.with_orchard_tree_mut(|tree| {
                 tree.truncate_to_checkpoint(&truncation_height).map(|_| ())
             })?;
+            #[cfg(feature = "orchard")]
+            self.with_ironwood_tree_mut(|tree| {
+                tree.truncate_to_checkpoint(&truncation_height).map(|_| ())
+            })?;
 
             // Do not delete sent notes; this can contain data that is not recoverable
             // from the chain. Wallets must continue to operate correctly in the
@@ -1098,58 +1440,10 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
         }
         Ok(truncation_height)
     }
-
-    fn truncate_to_chain_state(&mut self, _chain_state: ChainState) -> Result<(), Self::Error> {
-        todo!()
-    }
-
-    fn rewind_to_chain_state(
+    fn store_transactions_to_be_sent_inner(
         &mut self,
-        _chain_state: ChainState,
-        _reset_account_birthdays: HashSet<Self::AccountId>,
-    ) -> Result<(), RewindError<Self::AccountId, Self::Error>> {
-        todo!()
-    }
-
-    fn import_account_hd(
-        &mut self,
-        _account_name: &str,
-        _seed: &SecretVec<u8>,
-        _account_index: zip32::AccountId,
-        _birthday: &AccountBirthday,
-        _key_source: Option<&str>,
-    ) -> Result<(Self::Account, UnifiedSpendingKey), Self::Error> {
-        unimplemented!(
-            "Memwallet does not support adding accounts from seed phrases. 
-Instead derive the ufvk in the calling code and import it using `import_account_ufvk`"
-        )
-    }
-
-    fn import_account_ufvk(
-        &mut self,
-        account_name: &str,
-        unified_key: &UnifiedFullViewingKey,
-        birthday: &AccountBirthday,
-        purpose: AccountPurpose,
-        key_source: Option<&str>,
-    ) -> Result<Self::Account, Self::Error> {
-        tracing::debug!("import_account_ufvk");
-        let (_id, account) = self.add_account(
-            account_name,
-            AccountSource::Imported {
-                purpose,
-                key_source: key_source.map(str::to_owned),
-            },
-            unified_key.to_owned(),
-            birthday.clone(),
-        )?;
-        Ok(account)
-    }
-
-    fn store_transactions_to_be_sent(
-        &mut self,
-        transactions: &[SentTransaction<Self::AccountId>],
-    ) -> Result<(), Self::Error> {
+        transactions: &[SentTransaction<AccountId>],
+    ) -> Result<(), Error> {
         tracing::debug!("store_transactions_to_be_sent");
         for sent_tx in transactions {
             self.tx_table.put_tx_data(
@@ -1185,6 +1479,27 @@ Instead derive the ufvk in the calling code and import it using `import_account_
 
                 #[cfg(not(feature = "orchard"))]
                 panic!("Sent a transaction with Orchard Actions without `orchard` enabled?");
+            }
+            // Mark ironwood notes as spent
+            if let Some(_bundle) = sent_tx.tx().ironwood_bundle() {
+                #[cfg(feature = "orchard")]
+                {
+                    detectable_via_scanning = true;
+                    for action in _bundle.actions() {
+                        match self
+                            .mark_ironwood_note_spent(*action.nullifier(), sent_tx.tx().txid())
+                        {
+                            Ok(()) => {}
+                            Err(Error::NoteNotFound) => {
+                                // Dummy spends and spends of notes this wallet does not hold.
+                            }
+                            Err(e) => return Err(e),
+                        }
+                    }
+                }
+
+                #[cfg(not(feature = "orchard"))]
+                panic!("Sent a transaction with Ironwood Actions without `orchard` enabled?");
             }
             // Mark transparent UTXOs as spent
             #[cfg(feature = "transparent-inputs")]
@@ -1238,92 +1553,6 @@ Instead derive the ufvk in the calling code and import it using `import_account_
         }
 
         Ok(())
-    }
-
-    fn set_transaction_status(
-        &mut self,
-        txid: TxId,
-        status: TransactionStatus,
-    ) -> Result<(), Self::Error> {
-        tracing::debug!("set_transaction_status");
-        self.tx_table.set_transaction_status(&txid, status)
-    }
-
-    #[cfg(feature = "transparent-inputs")]
-    fn reserve_next_n_ephemeral_addresses(
-        &mut self,
-        account_id: Self::AccountId,
-        n: usize,
-    ) -> Result<Vec<(TransparentAddress, TransparentAddressMetadata)>, Self::Error> {
-        use zcash_keys::keys::AddressGenerationError;
-        // TODO: We need to implement first_unsafe_index to make sure we dont violate gap invarient
-
-        use transparent::keys::NonHardenedChildIndex;
-        let first_unsafe = self.first_unsafe_index(account_id)?;
-        if let Some(account) = self.accounts.get_mut(account_id) {
-            let first_unreserved = account.first_unreserved_index()?;
-
-            let allocation = range_from(first_unreserved, u32::try_from(n).unwrap());
-
-            if allocation.len() < n {
-                return Err(AddressGenerationError::DiversifierSpaceExhausted.into());
-            }
-            if allocation.end > first_unsafe {
-                return Err(Error::ReachedGapLimit(
-                    account_id,
-                    core::cmp::max(first_unreserved, first_unsafe),
-                ));
-            }
-            let _reserved = account.reserve_until(allocation.end)?;
-            self.get_known_ephemeral_addresses(
-                account_id,
-                Some(
-                    NonHardenedChildIndex::from_index(allocation.start).expect("Bad Index")
-                        ..NonHardenedChildIndex::from_index(allocation.end).expect("Bad Index"),
-                ),
-            )
-        } else {
-            Err(Self::Error::AccountUnknown(account_id))
-        }
-    }
-
-    fn get_address_for_index(
-        &mut self,
-        _account: Self::AccountId,
-        _diversifier_index: DiversifierIndex,
-        _request: UnifiedAddressRequest,
-    ) -> Result<Option<UnifiedAddress>, Self::Error> {
-        todo!()
-    }
-
-    #[cfg(feature = "transparent-inputs")]
-    fn notify_address_checked(
-        &mut self,
-        _request: TransactionsInvolvingAddress,
-        _as_of_height: BlockHeight,
-    ) -> Result<(), Self::Error> {
-        // No-op for now - this notifies that an address range was checked for transactions.
-        // In the sqlite implementation, this updates address metadata tracking.
-        // For the memory wallet, we don't need to track this state.
-        Ok(())
-    }
-
-    #[cfg(feature = "transparent-key-import")]
-    fn import_standalone_transparent_pubkey(
-        &mut self,
-        _account: Self::AccountId,
-        _pubkey: secp256k1::PublicKey,
-    ) -> Result<(), Self::Error> {
-        todo!()
-    }
-
-    #[cfg(feature = "transparent-key-import")]
-    fn import_standalone_transparent_script(
-        &mut self,
-        _account: Self::AccountId,
-        _script: zcash_script::script::Redeem,
-    ) -> Result<(), Self::Error> {
-        todo!()
     }
 }
 

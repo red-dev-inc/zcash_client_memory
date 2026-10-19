@@ -169,3 +169,65 @@ fn scan_cached_blocks_detects_spends_out_of_order() {
 fn receive_two_notes_with_same_value() {
     testing::pool::receive_two_notes_with_same_value::<OrchardPoolTester>()
 }
+
+// NU6.3 (Ironwood) cases from the backend harness. These exercise the Ironwood note
+// commitment tree and the Ironwood routing of Orchard-receiver payments. The harness's
+// coinbase-shielding cases are not included: the store cannot select coinbase outputs
+// (its transaction table never learns a pure-transparent transaction's block index, so the
+// coinbase filter excludes them), which fails before anything Ironwood-specific runs.
+
+#[test]
+#[cfg(feature = "pczt-tests")]
+fn create_pczt_supports_ironwood_output() {
+    testing::pool::create_pczt_supports_ironwood_output()
+}
+
+#[test]
+fn propose_v5_payment_to_orchard_receiver_is_rejected() {
+    testing::pool::propose_v5_payment_to_orchard_receiver_is_rejected()
+}
+
+#[test]
+fn proposal_records_and_serializes_proposed_version() {
+    testing::pool::proposal_records_and_serializes_proposed_version()
+}
+
+#[test]
+fn spent_nullifiers_stay_hidden_after_pruning() {
+    use zcash_client_backend::data_api::WalletRead;
+    testing::pool::spent_nullifiers_stay_hidden_after_pruning::<OrchardPoolTester>(
+        |wallet, query| {
+            wallet
+                .get_orchard_nullifiers(query)
+                .unwrap()
+                .into_iter()
+                .map(|(_, nf)| nf)
+                .collect()
+        },
+    )
+}
+
+#[test]
+fn rolled_back_spend_returns_the_note_to_unspent() {
+    use zcash_client_backend::data_api::WalletRead;
+    testing::pool::rolled_back_spend_returns_the_note_to_unspent::<OrchardPoolTester>(
+        |wallet, query| {
+            wallet
+                .get_orchard_nullifiers(query)
+                .unwrap()
+                .into_iter()
+                .map(|(_, nf)| nf)
+                .collect()
+        },
+    );
+}
+
+#[test]
+fn failed_put_blocks_leaves_the_wallet_dirty() {
+    testing::pool::failed_put_blocks_leaves_the_wallet_dirty::<OrchardPoolTester>()
+}
+
+#[test]
+fn sync_state_accessors() {
+    testing::pool::sync_state_accessors::<OrchardPoolTester>()
+}
