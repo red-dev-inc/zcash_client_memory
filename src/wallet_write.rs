@@ -29,7 +29,7 @@ use zcash_client_backend::{
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::{
     PoolType,
-    ShieldedPool::{self as ShieldedProtocol, Sapling},
+    ShieldedPool::{self as ShieldedPool, Sapling},
     TxId,
     consensus::{self, BlockHeight, NetworkUpgrade},
 };
@@ -43,8 +43,7 @@ use crate::{
 #[cfg(feature = "orchard")]
 use {
     shardtree::error::ShardTreeError, std::collections::BTreeMap,
-    zcash_client_backend::data_api::ORCHARD_SHARD_HEIGHT,
-    zcash_protocol::ShieldedPool::Orchard,
+    zcash_client_backend::data_api::ORCHARD_SHARD_HEIGHT, zcash_protocol::ShieldedPool::Orchard,
 };
 
 #[cfg(feature = "transparent-inputs")]
@@ -403,19 +402,16 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
             #[cfg(feature = "orchard")]
             self.insert_orchard_nullifier_map(block.height(), block.orchard().nullifier_map())?;
             note_positions.extend(block.transactions().iter().flat_map(|wtx| {
-                let iter = wtx.sapling_outputs().iter().map(|out| {
-                    (
-                        ShieldedProtocol::Sapling,
-                        out.note_commitment_tree_position(),
-                    )
-                });
+                let iter = wtx
+                    .sapling_outputs()
+                    .iter()
+                    .map(|out| (ShieldedPool::Sapling, out.note_commitment_tree_position()));
                 #[cfg(feature = "orchard")]
-                let iter = iter.chain(wtx.orchard_outputs().iter().map(|out| {
-                    (
-                        ShieldedProtocol::Orchard,
-                        out.note_commitment_tree_position(),
-                    )
-                }));
+                let iter = iter.chain(
+                    wtx.orchard_outputs()
+                        .iter()
+                        .map(|out| (ShieldedPool::Orchard, out.note_commitment_tree_position())),
+                );
 
                 iter
             }));
@@ -448,6 +444,9 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
             #[cfg(feature = "orchard")]
             orchard_commitments.extend(block_commitments.orchard.into_iter().map(Some));
         }
+
+        // Drop nullifier-map entries that can no longer be matched, as the upstream `put_blocks` does.
+        self.prune_tracked_nullifiers(PRUNING_DEPTH)?;
 
         if let Some((start_positions, last_scanned_height)) =
             start_positions.zip(last_scanned_height)
@@ -724,10 +723,8 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
                 }
                 TransferType::Incoming => {
                     // Store incoming Sapling note
-                    let received_note = ReceivedNote::from_decrypted_sapling_output(
-                        d_tx.tx().txid(),
-                        output,
-                    )?;
+                    let received_note =
+                        ReceivedNote::from_decrypted_sapling_output(d_tx.tx().txid(), output)?;
                     self.received_notes.insert_received_note(received_note);
                 }
                 TransferType::WalletInternal => unreachable!(
@@ -807,10 +804,8 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
                 }
                 TransferType::Incoming => {
                     // Store incoming Orchard note
-                    let received_note = ReceivedNote::from_decrypted_orchard_output(
-                        d_tx.tx().txid(),
-                        output,
-                    )?;
+                    let received_note =
+                        ReceivedNote::from_decrypted_orchard_output(d_tx.tx().txid(), output)?;
                     self.received_notes.insert_received_note(received_note);
                 }
                 TransferType::WalletInternal => unreachable!(

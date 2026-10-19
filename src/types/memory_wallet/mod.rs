@@ -31,7 +31,7 @@ use zcash_client_backend::{
 use zcash_keys::keys::UnifiedFullViewingKey;
 use zcash_primitives::transaction::Transaction;
 use zcash_protocol::{
-    ShieldedProtocol, TxId,
+    ShieldedPool, TxId,
     consensus::{self, BlockHeight, NetworkUpgrade, TxIndex},
 };
 use zip32::{Scope, fingerprint::SeedFingerprint};
@@ -616,6 +616,28 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
             self.received_note_spends.insert_spend(note_id, spent_in);
         }
     }
+    /// Drops nullifier-map and transaction-locator entries mined below
+    /// `fully_scanned_height - pruning_depth`, matching `zcash_client_sqlite`'s
+    /// `prune_tracked_nullifiers`.
+    ///
+    /// The maps exist so that a note found by out-of-order scanning can be matched to a spend in a
+    /// block that was scanned earlier. Every block below the fully scanned height has been scanned,
+    /// so no undiscovered note can exist there, and once the height is also past reorg depth the
+    /// entries below it can never be looked up again. Without this, a historic sync keeps every
+    /// nullifier on chain in memory (and in the serialized wallet) for the life of the wallet.
+    pub(crate) fn prune_tracked_nullifiers(&mut self, pruning_depth: u32) -> Result<(), Error> {
+        if let Some(meta) = self.block_fully_scanned()? {
+            self.prune_nullifier_map_below(meta.block_height().saturating_sub(pruning_depth));
+        }
+        Ok(())
+    }
+
+    /// Removes every nullifier-map and transaction-locator entry mined below `cutoff`.
+    pub(crate) fn prune_nullifier_map_below(&mut self, cutoff: BlockHeight) {
+        self.tx_locator.0.retain(|(height, _), _| *height >= cutoff);
+        self.nullifiers.0.retain(|_, (height, _)| *height >= cutoff);
+    }
+
     pub(crate) fn insert_sapling_nullifier_map(
         &mut self,
         block_height: BlockHeight,
@@ -769,7 +791,7 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
     pub(crate) fn scan_complete(
         &mut self,
         range: Range<BlockHeight>,
-        wallet_note_positions: &[(ShieldedProtocol, Position)],
+        wallet_note_positions: &[(ShieldedPool, Position)],
     ) -> Result<(), Error> {
         let wallet_birthday = self.get_wallet_birthday()?;
 
@@ -784,12 +806,12 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
             let mut required_orchard_subtrees = BTreeSet::new();
             for (protocol, position) in wallet_note_positions {
                 match protocol {
-                    ShieldedProtocol::Sapling => {
+                    ShieldedPool::Sapling => {
                         required_sapling_subtrees.insert(
                             Address::above_position(SAPLING_SHARD_HEIGHT.into(), *position).index(),
                         );
                     }
-                    ShieldedProtocol::Orchard => {
+                    ShieldedPool::Orchard => {
                         #[cfg(feature = "orchard")]
                         required_orchard_subtrees.insert(
                             Address::above_position(ORCHARD_SHARD_HEIGHT.into(), *position).index(),
@@ -801,14 +823,14 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
                     // The in-memory backend scans only Sapling and Orchard outputs (see
                     // `note_positions` construction in `put_blocks`), so it never records an
                     // Ironwood (NU6.3) note position here.
-                    ShieldedProtocol::Ironwood => unreachable!(
-                        "the in-memory backend does not scan Ironwood note positions"
-                    ),
+                    ShieldedPool::Ironwood => {
+                        unreachable!("the in-memory backend does not scan Ironwood note positions")
+                    }
                 }
             }
 
             let extended_range = self.extend_range(
-                &ShieldedProtocol::Sapling,
+                &ShieldedPool::Sapling,
                 &range,
                 required_sapling_subtrees,
                 self.params.activation_height(NetworkUpgrade::Sapling),
@@ -818,7 +840,7 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
             #[cfg(feature = "orchard")]
             let extended_range = self
                 .extend_range(
-                    &ShieldedProtocol::Orchard,
+                    &ShieldedPool::Orchard,
                     extended_range.as_ref().unwrap_or(&range),
                     required_orchard_subtrees,
                     self.params.activation_height(NetworkUpgrade::Nu5),
@@ -861,7 +883,7 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
     // given subtree indices, bounded by the wallet birthday and the fallback start height.
     fn extend_range(
         &self,
-        pool: &ShieldedProtocol,
+        pool: &ShieldedPool,
         range: &Range<BlockHeight>,
         required_subtree_indices: BTreeSet<u64>,
         fallback_start_height: Option<BlockHeight>,
@@ -875,11 +897,11 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
 
         let shard_end = |index| -> Result<_, Error> {
             match pool {
-                ShieldedProtocol::Sapling => Ok(self
+                ShieldedPool::Sapling => Ok(self
                     .sapling_tree_shard_end_heights
                     .get(&Address::from_parts(SAPLING_SHARD_HEIGHT.into(), index))
                     .cloned()),
-                ShieldedProtocol::Orchard => {
+                ShieldedPool::Orchard => {
                     #[cfg(feature = "orchard")]
                     {
                         Ok(self
@@ -892,9 +914,9 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
                 }
                 // `extend_range` is only ever invoked for the Sapling and Orchard pools; the
                 // in-memory backend maintains no Ironwood (NU6.3) shard-end height map.
-                ShieldedProtocol::Ironwood => unreachable!(
-                    "extend_range is not invoked for the Ironwood pool"
-                ),
+                ShieldedPool::Ironwood => {
+                    unreachable!("extend_range is not invoked for the Ironwood pool")
+                }
             }
         };
 
@@ -1253,5 +1275,128 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
     /// Returns the block_time for a given block height, if the block is in the wallet's cache
     pub fn get_block_time(&self, height: BlockHeight) -> Option<u32> {
         self.blocks.get(&height).map(|block| block.block_time)
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::PRUNING_DEPTH;
+    use zcash_protocol::consensus::Network;
+
+    fn sapling_nf(byte: u8) -> Nullifier {
+        Nullifier::Sapling(sapling::Nullifier([byte; 32]))
+    }
+
+    fn txid(byte: u8) -> TxId {
+        TxId::from_bytes([byte; 32])
+    }
+
+    /// Inserts one Sapling nullifier (and its transaction locator) per `(height, byte)` pair.
+    fn insert_sapling_entries(db: &mut MemoryWalletDb<Network>, entries: &[(u32, u8)]) {
+        for (height, byte) in entries {
+            db.insert_sapling_nullifier_map(
+                (*height).into(),
+                &[(
+                    TxIndex::from(*byte as u16),
+                    txid(*byte),
+                    vec![sapling::Nullifier([*byte; 32])],
+                )],
+            )
+            .unwrap();
+        }
+    }
+
+    fn locator_heights(db: &MemoryWalletDb<Network>) -> Vec<u32> {
+        db.tx_locator.0.keys().map(|(h, _)| u32::from(*h)).collect()
+    }
+
+    #[test]
+    fn prune_nullifier_map_below_keeps_entries_at_and_above_cutoff() {
+        let mut db = MemoryWalletDb::new(Network::TestNetwork, 100);
+        insert_sapling_entries(&mut db, &[(100, 1), (199, 2), (200, 3), (201, 4), (500, 5)]);
+        assert_eq!(db.nullifiers.0.len(), 5);
+        assert_eq!(db.tx_locator.0.len(), 5);
+
+        db.prune_nullifier_map_below(200.into());
+
+        assert!(db.nullifiers.get(&sapling_nf(1)).is_none());
+        assert!(db.nullifiers.get(&sapling_nf(2)).is_none());
+        assert_eq!(db.nullifiers.get(&sapling_nf(3)), Some(&(200.into(), 3)));
+        assert_eq!(db.nullifiers.get(&sapling_nf(4)), Some(&(201.into(), 4)));
+        assert_eq!(db.nullifiers.get(&sapling_nf(5)), Some(&(500.into(), 5)));
+        assert_eq!(locator_heights(&db), vec![200, 201, 500]);
+    }
+
+    #[test]
+    fn prune_nullifier_map_below_is_idempotent() {
+        let mut db = MemoryWalletDb::new(Network::TestNetwork, 100);
+        insert_sapling_entries(&mut db, &[(100, 1), (300, 2)]);
+
+        db.prune_nullifier_map_below(200.into());
+        let after_first = (db.nullifiers.clone(), db.tx_locator.clone());
+        db.prune_nullifier_map_below(200.into());
+
+        assert_eq!((db.nullifiers.clone(), db.tx_locator.clone()), after_first);
+        assert_eq!(locator_heights(&db), vec![300]);
+    }
+
+    #[test]
+    fn prune_nullifier_map_below_zero_keeps_everything() {
+        let mut db = MemoryWalletDb::new(Network::TestNetwork, 100);
+        insert_sapling_entries(&mut db, &[(0, 1), (100, 2)]);
+
+        db.prune_nullifier_map_below(0.into());
+
+        assert_eq!(db.nullifiers.0.len(), 2);
+        assert_eq!(locator_heights(&db), vec![0, 100]);
+    }
+
+    #[test]
+    #[cfg(feature = "orchard")]
+    fn prune_nullifier_map_below_prunes_orchard_entries() {
+        let mut db = MemoryWalletDb::new(Network::TestNetwork, 100);
+        let orchard_nf = |byte: u8| {
+            // `CtOption::unwrap` panics if the bytes are not a canonical field element.
+            orchard::note::Nullifier::from_bytes(&[byte; 32]).unwrap()
+        };
+        for (height, byte) in [(100u32, 1u8), (200, 2)] {
+            db.insert_orchard_nullifier_map(
+                height.into(),
+                &[(
+                    TxIndex::from(byte as u16),
+                    txid(byte),
+                    vec![orchard_nf(byte)],
+                )],
+            )
+            .unwrap();
+        }
+
+        db.prune_nullifier_map_below(200.into());
+
+        assert!(
+            db.nullifiers
+                .get(&Nullifier::Orchard(orchard_nf(1)))
+                .is_none()
+        );
+        assert_eq!(
+            db.nullifiers.get(&Nullifier::Orchard(orchard_nf(2))),
+            Some(&(200.into(), 2))
+        );
+        assert_eq!(locator_heights(&db), vec![200]);
+    }
+
+    #[test]
+    fn prune_tracked_nullifiers_is_a_noop_without_a_fully_scanned_height() {
+        // A wallet with no accounts has no birthday, hence no fully scanned height, so there is
+        // no safe cutoff and nothing may be pruned.
+        let mut db = MemoryWalletDb::new(Network::TestNetwork, 100);
+        insert_sapling_entries(&mut db, &[(0, 1), (1_000, 2), (1_000_000, 3)]);
+        assert!(db.block_fully_scanned().unwrap().is_none());
+
+        db.prune_tracked_nullifiers(PRUNING_DEPTH).unwrap();
+
+        assert_eq!(db.nullifiers.0.len(), 3);
+        assert_eq!(locator_heights(&db), vec![0, 1_000, 1_000_000]);
     }
 }
