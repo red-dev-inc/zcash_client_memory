@@ -483,10 +483,8 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
                     TransactionStatus::Mined(_height) => true,
                     TransactionStatus::TxidNotRecognized => unreachable!(),
                     TransactionStatus::NotInMainChain => {
-                        // The spend counts while the transaction cannot have lapsed: it never
-                        // expires (expiry height 0) or expires at or after the target height. An
-                        // unknown expiry (`None`, an entry created by a scan that was then rolled
-                        // back) may have lapsed, so the note is treated as unspent.
+                        // Spend counts only if the tx cannot have lapsed: never expires (0) or
+                        // expires at/after target. Unknown expiry (`None`, reorged scan) → unspent.
                         spending_tx.expiry_height().is_some_and(|h| {
                             h == BlockHeight::from(0) || h >= BlockHeight::from(target_height)
                         })
@@ -720,15 +718,8 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
         }
     }
 
-    /// Drops nullifier-map and transaction-locator entries mined below
-    /// `fully_scanned_height - pruning_depth`, matching `zcash_client_sqlite`'s
-    /// `prune_tracked_nullifiers`.
-    ///
-    /// The maps exist so that a note found by out-of-order scanning can be matched to a spend in a
-    /// block that was scanned earlier. Every block below the fully scanned height has been scanned,
-    /// so no undiscovered note can exist there, and once the height is also past reorg depth the
-    /// entries below it can never be looked up again. Without this, a historic sync keeps every
-    /// nullifier on chain in memory (and in the serialized wallet) for the life of the wallet.
+    /// Drops nullifier-map and tx-locator entries below `fully_scanned_height - pruning_depth`
+    /// (past reorg depth they can never be matched again); otherwise a historic sync retains them all.
     pub(crate) fn prune_tracked_nullifiers(&mut self, pruning_depth: u32) -> Result<(), Error> {
         if let Some(meta) = self.block_fully_scanned()? {
             self.prune_nullifier_map_below(meta.block_height().saturating_sub(pruning_depth));
@@ -1464,14 +1455,8 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
     }
 }
 
-/// Returns the greatest checkpoint height in `store` whose block has at least
-/// `min_confirmations` confirmations at `chain_tip_height`, or `None` if the tree has no such
-/// checkpoint.
-///
-/// Only the tree's checkpoints are visited, of which there are at most `max_checkpoints`. Probing
-/// every block height downwards from the tip would walk the whole chain whenever the tree has no
-/// checkpoints, which is the state of the Orchard tree before NU5 and of the Ironwood tree before
-/// NU6.3 or in a wallet restored from a snapshot taken before Ironwood support.
+/// Greatest checkpoint height in `store` with at least `min_confirmations` at the tip. Visits only
+/// the tree's checkpoints; probing every height would walk the whole chain when the tree has none.
 fn max_checkpointed_height<H: Clone>(
     store: &MemoryShardStore<H, BlockHeight>,
     chain_tip_height: BlockHeight,

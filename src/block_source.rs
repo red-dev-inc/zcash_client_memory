@@ -103,11 +103,8 @@ impl BlockCache for MemBlockCache {
         Ok(())
     }
 
-    // Not an `async fn`: `zcash_client_backend::sync::run` collects the futures returned by
-    // `delete` and only awaits them once the whole sync has finished. A lazy `async fn` body would
-    // therefore keep every downloaded block in memory for the entire sync (gigabytes when syncing
-    // from an old birthday, which traps the wasm worker with `RuntimeError: unreachable`), so the
-    // blocks are removed eagerly when `delete` is called and an already-ready future is returned.
+    // Not an `async fn`: sync::run awaits the delete futures only after the whole sync, so a lazy
+    // body would keep every block in memory (OOM `RuntimeError: unreachable`). Delete eagerly here.
     fn delete<'life0, 'async_trait>(
         &'life0 self,
         range: ScanRange,

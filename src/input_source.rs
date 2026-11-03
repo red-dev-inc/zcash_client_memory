@@ -598,10 +598,8 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
                     TransactionStatus::Mined(_height) => true,
                     TransactionStatus::TxidNotRecognized => unreachable!(),
                     TransactionStatus::NotInMainChain => {
-                        // The spend counts while the transaction cannot have lapsed: it never
-                        // expires (expiry height 0) or expires at or after the target height. An
-                        // unknown expiry (`None`, an entry created by a scan that was then rolled
-                        // back) may have lapsed, so the note is treated as unspent.
+                        // Spend counts only if the tx cannot have lapsed: never expires (0) or
+                        // expires at/after target. Unknown expiry (`None`, reorged scan) → unspent.
                         spending_tx.expiry_height().is_some_and(|h| {
                             h == BlockHeight::from(0) || h >= BlockHeight::from(target_height)
                         })

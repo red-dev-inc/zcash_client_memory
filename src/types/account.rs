@@ -683,9 +683,8 @@ mod serialization {
                     .map(|(di, a)| proto::Address {
                         diversifier_index: di.as_bytes().to_vec(),
                         // Convention is to encode using mainnet encoding regardless of network.
-                        // `encode` now preserves every receiver and metadata item (it folded in
-                        // the old `encode_receiver_preserving`), so the transparent receiver of an
-                        // address with a shielded receiver survives a wallet restore.
+                        // `encode` preserves every receiver, so a transparent receiver survives a
+                        // restore (it replaced the old `encode_receiver_preserving`).
                         address: a.encode(&EncodingParams),
                     })
                     .collect(),

@@ -40,10 +40,8 @@ impl<P: consensus::Parameters> WalletCommitmentTrees for MemoryWalletDb<P> {
         roots: &[CommitmentTreeRoot<sapling::Node>],
     ) -> Result<(), ShardTreeError<Self::Error>> {
         tracing::debug!("put_sapling_subtree_roots");
-        // `update_subtree_roots` re-sends every root from index 0 on each sync, and a
-        // subtree's root never changes. Skip the shards whose root the tree already holds:
-        // re-inserting roots into populated shards pegs a CPU core and freezes sync at
-        // mainnet scale (1129 Sapling subtrees). `subtree_root` is a cheap store lookup.
+        // Skip shards whose root the tree already holds. update_subtree_roots re-sends all roots
+        // every sync; re-inserting into populated shards pegs a CPU core at mainnet scale.
         let mut missing = Vec::new();
         for i in 0..roots.len() as u64 {
             if subtree_root(&self.sapling_tree, SAPLING_SHARD_HEIGHT, start_index + i)?.is_none() {
