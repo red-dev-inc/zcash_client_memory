@@ -16,13 +16,13 @@ categories = ["cryptography::cryptocurrencies"]
 # Backend 0.25 enables `orchard` by default; this crate gates Orchard support behind its own
 # `orchard` feature, so the backend's defaults are not inherited. `zeroize` is kept so that
 # spending keys are overwritten when dropped.
-zcash_client_backend = {version = "=0.25.0-pre.1", default-features = false, features = ["zeroize", "unstable-serialization", "unstable-spanning-tree", "sync"]}
-zcash_address = {version = "=0.14.0-pre.1", default-features = false}
-zcash_keys = {version = "=0.17.0-pre.1", default-features = false, features = ["sapling"]}
+zcash_client_backend = {version = "=0.25.0", default-features = false, features = ["zeroize", "unstable-serialization", "unstable-spanning-tree", "sync"]}
+zcash_address = {version = "=0.14.0", default-features = false}
+zcash_keys = {version = "=0.17.0", default-features = false, features = ["sapling"]}
 zcash_encoding = {version = "0.5", default-features = false}
-zcash_primitives = {version = "=0.31.0-pre.1", default-features = false}
-zcash_protocol = {version = "=0.11.0-pre.0", default-features = false}
-transparent = {package = "zcash_transparent", version = "=0.11.0-pre.1", default-features = false}
+zcash_primitives = {version = "=0.31.0", default-features = false}
+zcash_protocol = {version = "=0.11.0", default-features = false}
+transparent = {package = "zcash_transparent", version = "=0.11.0", default-features = false}
 
 tokio = {version = "1", features = ["sync"]}
 
@@ -67,7 +67,8 @@ incrementalmerkletree = {version = "0.9", default-features = false}
 async-trait = { version = "0.1" }
 
 # - Test dependencies
-proptest = {version = ">=1,<1.7", optional = true}
+# NU7 final `zcash_client_backend` 0.25.0 requires proptest ^1.12, so the old `<1.7` cap no longer resolves.
+proptest = {version = ">=1,<2", optional = true}
 wasm_sync = "0.1.2"
 rayon = "1.5"
 bytes = "1.9.0"
@@ -81,9 +82,9 @@ getrandom = { version = "0.4", features = ["wasm_js"] }
 [dev-dependencies]
 ciborium = "0.2.2"
 serde_json = "1"
-zcash_client_backend = {version = "=0.25.0-pre.1", default-features = false, features = ["test-dependencies"]}
+zcash_client_backend = {version = "=0.25.0", default-features = false, features = ["test-dependencies"]}
 postcard = {version = "1", default-features = false, features = ["alloc"]}
-zip321 = "=0.10.0-pre.1"
+zip321 = "=0.10.0"
 
 
 [features]

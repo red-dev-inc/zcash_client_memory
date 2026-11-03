@@ -40,19 +40,32 @@ impl<P: consensus::Parameters> WalletCommitmentTrees for MemoryWalletDb<P> {
         roots: &[CommitmentTreeRoot<sapling::Node>],
     ) -> Result<(), ShardTreeError<Self::Error>> {
         tracing::debug!("put_sapling_subtree_roots");
+        // `update_subtree_roots` re-sends every root from index 0 on each sync, and a
+        // subtree's root never changes. Skip the shards whose root the tree already holds:
+        // re-inserting roots into populated shards pegs a CPU core and freezes sync at
+        // mainnet scale (1129 Sapling subtrees). `subtree_root` is a cheap store lookup.
+        let mut missing = Vec::new();
+        for i in 0..roots.len() as u64 {
+            if subtree_root(&self.sapling_tree, SAPLING_SHARD_HEIGHT, start_index + i)?.is_none() {
+                missing.push(i);
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
         self.with_sapling_tree_mut(|t| {
-            for (root, i) in roots.iter().zip(0u64..) {
+            for &i in &missing {
                 let root_addr = Address::from_parts(SAPLING_SHARD_HEIGHT.into(), start_index + i);
-                t.insert(root_addr, *root.root_hash())?;
+                t.insert(root_addr, *roots[i as usize].root_hash())?;
             }
             Ok::<_, ShardTreeError<Self::Error>>(())
         })?;
 
-        // store the end block heights for each shard as well
-        for (root, i) in roots.iter().zip(0u64..) {
+        // store the end block heights for the newly inserted shards as well
+        for &i in &missing {
             let root_addr = Address::from_parts(SAPLING_SHARD_HEIGHT.into(), start_index + i);
             self.sapling_tree_shard_end_heights
-                .insert(root_addr, root.subtree_end_height());
+                .insert(root_addr, roots[i as usize].subtree_end_height());
         }
 
         Ok(())
@@ -102,19 +115,29 @@ impl<P: consensus::Parameters> WalletCommitmentTrees for MemoryWalletDb<P> {
         roots: &[CommitmentTreeRoot<orchard::tree::MerkleHashOrchard>],
     ) -> Result<(), ShardTreeError<Self::Error>> {
         tracing::debug!("put_orchard_subtree_roots");
+        // Skip shards already present; see put_sapling_subtree_roots.
+        let mut missing = Vec::new();
+        for i in 0..roots.len() as u64 {
+            if subtree_root(&self.orchard_tree, ORCHARD_SHARD_HEIGHT, start_index + i)?.is_none() {
+                missing.push(i);
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
         self.with_orchard_tree_mut(|t| {
-            for (root, i) in roots.iter().zip(0u64..) {
+            for &i in &missing {
                 let root_addr = Address::from_parts(ORCHARD_SHARD_HEIGHT.into(), start_index + i);
-                t.insert(root_addr, *root.root_hash())?;
+                t.insert(root_addr, *roots[i as usize].root_hash())?;
             }
             Ok::<_, ShardTreeError<Self::Error>>(())
         })?;
 
-        // store the end block heights for each shard as well
-        for (root, i) in roots.iter().zip(0u64..) {
+        // store the end block heights for the newly inserted shards as well
+        for &i in &missing {
             let root_addr = Address::from_parts(SAPLING_SHARD_HEIGHT.into(), start_index + i);
             self.orchard_tree_shard_end_heights
-                .insert(root_addr, root.subtree_end_height());
+                .insert(root_addr, roots[i as usize].subtree_end_height());
         }
 
         Ok(())
@@ -143,16 +166,27 @@ impl<P: consensus::Parameters> WalletCommitmentTrees for MemoryWalletDb<P> {
         roots: &[CommitmentTreeRoot<orchard::tree::MerkleHashOrchard>],
     ) -> Result<(), ShardTreeError<Self::Error>> {
         tracing::debug!("put_ironwood_subtree_roots");
-        for (root, i) in roots.iter().zip(0u64..) {
+        // Skip shards already present; see put_sapling_subtree_roots.
+        let mut missing = Vec::new();
+        for i in 0..roots.len() as u64 {
+            if subtree_root(&self.ironwood_tree, ORCHARD_SHARD_HEIGHT, start_index + i)?.is_none() {
+                missing.push(i);
+            }
+        }
+        if missing.is_empty() {
+            return Ok(());
+        }
+        for &i in &missing {
             let root_addr = Address::from_parts(ORCHARD_SHARD_HEIGHT.into(), start_index + i);
-            self.ironwood_tree.insert(root_addr, *root.root_hash())?;
+            self.ironwood_tree
+                .insert(root_addr, *roots[i as usize].root_hash())?;
         }
 
-        // store the end block heights for each shard as well
-        for (root, i) in roots.iter().zip(0u64..) {
+        // store the end block heights for the newly inserted shards as well
+        for &i in &missing {
             let root_addr = Address::from_parts(ORCHARD_SHARD_HEIGHT.into(), start_index + i);
             self.ironwood_tree_shard_end_heights
-                .insert(root_addr, root.subtree_end_height());
+                .insert(root_addr, roots[i as usize].subtree_end_height());
         }
 
         Ok(())

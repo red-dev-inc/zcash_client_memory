@@ -1,6 +1,8 @@
 use async_trait::async_trait;
 use std::collections::BTreeMap;
 use std::convert::Infallible;
+use std::future::Future;
+use std::pin::Pin;
 use wasm_sync::RwLock;
 use zcash_client_backend::data_api::chain::{BlockCache, BlockSource};
 use zcash_client_backend::data_api::scanning::ScanRange;
@@ -101,12 +103,24 @@ impl BlockCache for MemBlockCache {
         Ok(())
     }
 
-    async fn delete(&self, range: ScanRange) -> Result<(), Self::Error> {
+    // Not an `async fn`: `zcash_client_backend::sync::run` collects the futures returned by
+    // `delete` and only awaits them once the whole sync has finished. A lazy `async fn` body would
+    // therefore keep every downloaded block in memory for the entire sync (gigabytes when syncing
+    // from an old birthday, which traps the wasm worker with `RuntimeError: unreachable`), so the
+    // blocks are removed eagerly when `delete` is called and an already-ready future is returned.
+    fn delete<'life0, 'async_trait>(
+        &'life0 self,
+        range: ScanRange,
+    ) -> Pin<Box<dyn Future<Output = Result<(), Self::Error>> + Send + 'async_trait>>
+    where
+        'life0: 'async_trait,
+        Self: 'async_trait,
+    {
         let mut inner = self.0.write().unwrap();
         let range = range.block_range();
         for height in u32::from(range.start)..u32::from(range.end) {
             inner.remove(&height.into());
         }
-        Ok(())
+        Box::pin(std::future::ready(Ok(())))
     }
 }

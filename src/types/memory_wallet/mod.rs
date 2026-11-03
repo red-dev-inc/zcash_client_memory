@@ -483,11 +483,13 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
                     TransactionStatus::Mined(_height) => true,
                     TransactionStatus::TxidNotRecognized => unreachable!(),
                     TransactionStatus::NotInMainChain => {
-                        // transaction either never expires, or expires in the future.
-                        spending_tx
-                            .expiry_height()
-                            .iter()
-                            .all(|h| *h >= BlockHeight::from(target_height))
+                        // The spend counts while the transaction cannot have lapsed: it never
+                        // expires (expiry height 0) or expires at or after the target height. An
+                        // unknown expiry (`None`, an entry created by a scan that was then rolled
+                        // back) may have lapsed, so the note is treated as unspent.
+                        spending_tx.expiry_height().is_some_and(|h| {
+                            h == BlockHeight::from(0) || h >= BlockHeight::from(target_height)
+                        })
                     }
                 }
             }
@@ -609,9 +611,9 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
 
         Ok(tx.mined_height().map_or_else(
             || {
+                // `None` (unknown expiry) may have lapsed → unspent; `Some(0)` never expires.
                 tx.expiry_height()
-                    .iter()
-                    .all(|h| *h >= BlockHeight::from(target_height))
+                    .is_some_and(|h| h == BlockHeight::from(0) || h >= BlockHeight::from(target_height))
             },
             |h| match note.recipient_key_scope {
                 // If we don't know the recipient key scope, we treat the note as untrusted.
@@ -717,6 +719,29 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
             self.received_note_spends.insert_spend(note_id, spent_in);
         }
     }
+
+    /// Drops nullifier-map and transaction-locator entries mined below
+    /// `fully_scanned_height - pruning_depth`, matching `zcash_client_sqlite`'s
+    /// `prune_tracked_nullifiers`.
+    ///
+    /// The maps exist so that a note found by out-of-order scanning can be matched to a spend in a
+    /// block that was scanned earlier. Every block below the fully scanned height has been scanned,
+    /// so no undiscovered note can exist there, and once the height is also past reorg depth the
+    /// entries below it can never be looked up again. Without this, a historic sync keeps every
+    /// nullifier on chain in memory (and in the serialized wallet) for the life of the wallet.
+    pub(crate) fn prune_tracked_nullifiers(&mut self, pruning_depth: u32) -> Result<(), Error> {
+        if let Some(meta) = self.block_fully_scanned()? {
+            self.prune_nullifier_map_below(meta.block_height().saturating_sub(pruning_depth));
+        }
+        Ok(())
+    }
+
+    /// Removes every nullifier-map and transaction-locator entry mined below `cutoff`.
+    pub(crate) fn prune_nullifier_map_below(&mut self, cutoff: BlockHeight) {
+        self.tx_locator.0.retain(|(height, _), _| *height >= cutoff);
+        self.nullifiers.0.retain(|_, (height, _)| *height >= cutoff);
+    }
+
     pub(crate) fn insert_sapling_nullifier_map(
         &mut self,
         block_height: BlockHeight,
@@ -835,16 +860,11 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
         chain_tip_height: BlockHeight,
         min_confirmations: NonZeroU32,
     ) -> Result<Option<BlockHeight>, Error> {
-        let max_checkpoint_height =
-            u32::from(chain_tip_height).saturating_sub(u32::from(min_confirmations) - 1);
-        // scan backward and find the first checkpoint that matches a blockheight prior to max_checkpoint_height
-        for height in (0..=max_checkpoint_height).rev() {
-            let height = BlockHeight::from_u32(height);
-            if self.sapling_tree.store().get_checkpoint(&height)?.is_some() {
-                return Ok(Some(height));
-            }
-        }
-        Ok(None)
+        max_checkpointed_height(
+            self.sapling_tree.store(),
+            chain_tip_height,
+            min_confirmations,
+        )
     }
 
     #[cfg(feature = "orchard")]
@@ -853,16 +873,11 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
         chain_tip_height: BlockHeight,
         min_confirmations: NonZeroU32,
     ) -> Result<Option<BlockHeight>, Error> {
-        let max_checkpoint_height =
-            u32::from(chain_tip_height).saturating_sub(u32::from(min_confirmations) - 1);
-        // scan backward and find the first checkpoint that matches a blockheight prior to max_checkpoint_height
-        for height in (0..=max_checkpoint_height).rev() {
-            let height = BlockHeight::from_u32(height);
-            if self.orchard_tree.store().get_checkpoint(&height)?.is_some() {
-                return Ok(Some(height));
-            }
-        }
-        Ok(None)
+        max_checkpointed_height(
+            self.orchard_tree.store(),
+            chain_tip_height,
+            min_confirmations,
+        )
     }
 
     #[cfg(feature = "orchard")]
@@ -871,21 +886,11 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
         chain_tip_height: BlockHeight,
         min_confirmations: NonZeroU32,
     ) -> Result<Option<BlockHeight>, Error> {
-        let max_checkpoint_height =
-            u32::from(chain_tip_height).saturating_sub(u32::from(min_confirmations) - 1);
-        // scan backward and find the first checkpoint that matches a blockheight prior to max_checkpoint_height
-        for height in (0..=max_checkpoint_height).rev() {
-            let height = BlockHeight::from_u32(height);
-            if self
-                .ironwood_tree
-                .store()
-                .get_checkpoint(&height)?
-                .is_some()
-            {
-                return Ok(Some(height));
-            }
-        }
-        Ok(None)
+        max_checkpointed_height(
+            self.ironwood_tree.store(),
+            chain_tip_height,
+            min_confirmations,
+        )
     }
 
     /// Get the unscanned ranges from the scan queue and their corresponding sapling tree indices
@@ -1457,4 +1462,30 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
     pub fn get_block_time(&self, height: BlockHeight) -> Option<u32> {
         self.blocks.get(&height).map(|block| block.block_time)
     }
+}
+
+/// Returns the greatest checkpoint height in `store` whose block has at least
+/// `min_confirmations` confirmations at `chain_tip_height`, or `None` if the tree has no such
+/// checkpoint.
+///
+/// Only the tree's checkpoints are visited, of which there are at most `max_checkpoints`. Probing
+/// every block height downwards from the tip would walk the whole chain whenever the tree has no
+/// checkpoints, which is the state of the Orchard tree before NU5 and of the Ironwood tree before
+/// NU6.3 or in a wallet restored from a snapshot taken before Ironwood support.
+fn max_checkpointed_height<H: Clone>(
+    store: &MemoryShardStore<H, BlockHeight>,
+    chain_tip_height: BlockHeight,
+    min_confirmations: NonZeroU32,
+) -> Result<Option<BlockHeight>, Error> {
+    let max_checkpoint_height = BlockHeight::from_u32(
+        u32::from(chain_tip_height).saturating_sub(u32::from(min_confirmations) - 1),
+    );
+    let mut result: Option<BlockHeight> = None;
+    store.for_each_checkpoint(store.checkpoint_count()?, |height, _| {
+        if *height <= max_checkpoint_height {
+            result = Some(result.map_or(*height, |r| r.max(*height)));
+        }
+        Ok(())
+    })?;
+    Ok(result)
 }

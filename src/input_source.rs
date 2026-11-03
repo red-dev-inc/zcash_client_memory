@@ -3,7 +3,8 @@ use std::num::NonZeroU32;
 use shardtree::store::ShardStore;
 use zcash_client_backend::{
     data_api::{
-        AccountMeta, InputSource, NoteFilter, PoolMeta, ReceivedNotes, TargetValue, WalletRead,
+        Account as _, AccountMeta, ChangeReceivers, InputSource, NoteFilter, PoolMeta,
+        ReceivedNotes, TargetValue, WalletRead,
         locking::LockFilter,
         wallet::{ConfirmationsPolicy, TargetHeight},
     },
@@ -362,6 +363,18 @@ impl<P: consensus::Parameters> InputSource for MemoryWalletDb<P> {
             }))
     }
 
+    fn get_change_receivers(
+        &self,
+        account: Self::AccountId,
+    ) -> Result<ChangeReceivers, Self::Error> {
+        let uivk = self
+            .accounts
+            .get(account)
+            .ok_or(Error::AccountUnknown(account))?
+            .uivk();
+        Ok(ChangeReceivers::from_uivk(&uivk))
+    }
+
     fn get_account_metadata(
         &self,
         account_id: Self::AccountId,
@@ -418,6 +431,7 @@ impl<P: consensus::Parameters> InputSource for MemoryWalletDb<P> {
             sapling_pool_meta,
             orchard_pool_meta,
             ironwood_pool_meta,
+            self.get_change_receivers(account_id)?,
         ))
     }
 }
@@ -584,11 +598,13 @@ impl<P: consensus::Parameters> MemoryWalletDb<P> {
                     TransactionStatus::Mined(_height) => true,
                     TransactionStatus::TxidNotRecognized => unreachable!(),
                     TransactionStatus::NotInMainChain => {
-                        // transaction either never expires, or expires in the future.
-                        spending_tx
-                            .expiry_height()
-                            .iter()
-                            .all(|h| *h >= BlockHeight::from(target_height))
+                        // The spend counts while the transaction cannot have lapsed: it never
+                        // expires (expiry height 0) or expires at or after the target height. An
+                        // unknown expiry (`None`, an entry created by a scan that was then rolled
+                        // back) may have lapsed, so the note is treated as unspent.
+                        spending_tx.expiry_height().is_some_and(|h| {
+                            h == BlockHeight::from(0) || h >= BlockHeight::from(target_height)
+                        })
                     }
                 }
             }

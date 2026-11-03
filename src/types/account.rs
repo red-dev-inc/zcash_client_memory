@@ -287,6 +287,11 @@ impl Account {
         Ok(acc)
     }
 
+    /// Replaces this account's human-readable name. Used by `WalletWrite::set_account_name`.
+    pub(crate) fn set_name(&mut self, name: &str) {
+        self.account_name = name.to_string();
+    }
+
     pub(crate) fn addresses(&self) -> &BTreeMap<DiversifierIndex, UnifiedAddress> {
         &self.addresses
     }
@@ -678,10 +683,10 @@ mod serialization {
                     .map(|(di, a)| proto::Address {
                         diversifier_index: di.as_bytes().to_vec(),
                         // Convention is to encode using mainnet encoding regardless of network.
-                        // The receiver-preserving form is required here: the default encoding is
-                        // for sharing, and omits the transparent receiver of an address that has a
-                        // shielded receiver, which would lose it when the wallet is restored.
-                        address: a.encode_receiver_preserving(&EncodingParams),
+                        // `encode` now preserves every receiver and metadata item (it folded in
+                        // the old `encode_receiver_preserving`), so the transparent receiver of an
+                        // address with a shielded receiver survives a wallet restore.
+                        address: a.encode(&EncodingParams),
                     })
                     .collect(),
                 #[cfg(feature = "transparent-inputs")]

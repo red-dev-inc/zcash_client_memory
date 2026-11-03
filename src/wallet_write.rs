@@ -70,6 +70,18 @@ fn orchard_decrypted_output_value<A>(
 impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
     type UtxoRef = OutPoint;
 
+    fn set_account_name(
+        &mut self,
+        account: <Self as WalletRead>::AccountId,
+        name: &str,
+    ) -> Result<(), <Self as WalletRead>::Error> {
+        self.accounts
+            .get_mut(account)
+            .ok_or(Error::AccountUnknown(account))?
+            .set_name(name);
+        Ok(())
+    }
+
     fn create_account(
         &mut self,
         account_name: &str,
@@ -537,6 +549,10 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
             #[cfg(feature = "orchard")]
             ironwood_commitments.extend(block_commitments.ironwood.into_iter().map(Some));
         }
+
+        // Drop nullifier-map entries that can no longer be matched, as the upstream `put_blocks`
+        // does — otherwise a historic sync keeps every shielded spend in memory for the wallet's life.
+        self.prune_tracked_nullifiers(PRUNING_DEPTH)?;
 
         if let Some((start_positions, last_scanned_height)) =
             start_positions.zip(last_scanned_height)
@@ -1192,10 +1208,16 @@ impl<P: consensus::Parameters> WalletWrite for MemoryWalletDb<P> {
                     },
                 )?;
 
-                checkpoint_heights = checkpoint_heights
-                    .intersection(&orchard_checkpoint_heights)
-                    .copied()
-                    .collect();
+                // A tree without checkpoints has nothing to roll back and must not veto the
+                // rewind (the Orchard tree is empty before NU5), as zcash_client_sqlite does with
+                // its "or no checkpoints exist" clause; otherwise an empty tree makes the
+                // intersection empty and every rewind fails with RequestedRewindInvalid.
+                if !orchard_checkpoint_heights.is_empty() {
+                    checkpoint_heights = checkpoint_heights
+                        .intersection(&orchard_checkpoint_heights)
+                        .copied()
+                        .collect();
+                }
 
                 // A wallet migrated from the version 1 format has no Ironwood checkpoints until
                 // its first scan, so the Ironwood tree only constrains truncation once it has any.
